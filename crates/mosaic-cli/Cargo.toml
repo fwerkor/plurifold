@@ -1,0 +1,12 @@
+[package]
+name = "mosaic-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap.workspace = true
+mosaic-core = { path = "../mosaic-core" }
+mosaic-runtime = { path = "../mosaic-runtime" }
