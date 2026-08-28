@@ -1,6 +1,6 @@
 # Mosaic Fabric
 
-Mosaic Fabric is an experimental runtime for **elastic heterogeneous computing across weakly connected resources**. It targets a setting where CPUs, GPUs, NPUs, accelerators, edge devices, workstations, clusters, and cloud instances may differ in architecture and performance, may be separated by WAN links, and may join or leave while an application is running.
+Mosaic Fabric is an experimental runtime for **elastic heterogeneous computing across weakly connected resources**. It targets CPUs, GPUs, NPUs, accelerators, edge devices, workstations, clusters, and cloud instances that may differ in architecture and performance, may be separated by WAN links, and may join or leave while an application is running.
 
 The central rule is:
 
@@ -12,11 +12,11 @@ Mosaic does not pretend that a 150 ms WAN link is shared memory. Applications de
 
 Existing systems solve important parts of this problem: Legion provides a data-centric programming model, StarPU schedules heterogeneous tasks and data movement, Ray provides tasks/actors/objects and fault tolerance, Charm++ supports migratable objects, Globus Compute spans administrative domains, and WASI provides a portable component ABI. Mosaic explores the missing composition of these ideas for **highly heterogeneous, dynamically changing, weakly connected compute**.
 
-The initial research hypothesis is that useful global scheduling requires more than placement. A WAN-aware runtime should be able to adapt **computation granularity** by batching, fusing, replicating, migrating, and checkpointing work according to communication/computation ratio.
+The research hypothesis is that useful global scheduling requires more than placement. A WAN-aware runtime should be able to adapt **computation granularity** by batching, fusing, replicating, migrating, and checkpointing work according to communication/computation ratio.
 
 ## Core abstractions
 
-- **Task** — a schedulable computation with declared inputs, outputs, requirements, retry semantics, and cost hints.
+- **Task** — a schedulable computation with declared inputs, outputs, requirements, retry semantics, arguments, and cost hints.
 - **Object** — immutable/versioned data identified independently of its current physical location.
 - **Resource** — a leased description of compute, memory, accelerators, runtimes, network position, and reliability.
 - **Actor** — a logical stateful service whose state can be checkpointed and rebound to another resource (planned after the task/object core).
@@ -46,26 +46,49 @@ Resource fabric
 
 ## Repository status
 
-This repository currently contains the **v0 design scaffold and a compilable control-plane prototype**:
+The repository now contains a **v0.2 networked research prototype**, not only a design scaffold:
 
-- typed resource, task, object, topology, and lease models;
+- typed Resource, Task, Object, Topology, membership-lease, and execution-lease models;
 - a topology-aware placement cost model;
-- an in-memory elastic Fabric runtime that supports resource join/leave;
-- explicit retry/effect semantics;
-- a graph-fusion advisor for coarse WAN execution;
-- a protocol sketch for coordinator/agent communication;
-- an agent capability descriptor and CLI demo;
-- unit tests and CI.
+- a real HTTP/JSON coordinator control plane;
+- hot-pluggable agents with membership heartbeats and epoch-based reincarnation safety;
+- renewable work leases for long-running tasks;
+- a SHA-256 content-addressed local object cache;
+- direct agent-to-agent HTTP object transfer with digest verification and replica registration;
+- replay-safe retry after worker loss, with non-replay-safe tasks entering `Uncertain`;
+- a small builtin executor (`identity`, `concat`, `echo`, `sleep`) used to exercise the runtime without hiding unimplemented portability behind a fake generic executor;
+- a CLI for object publication, task submission/status, resource inspection, and topology links;
+- a multi-process E2E test that kills a worker during execution and verifies takeover by the survivor.
 
-It deliberately does **not** yet contain a production RPC layer, distributed object store, accelerator executors, or security boundary. Those are staged in the roadmap rather than hidden behind premature abstractions.
+Still intentionally missing: authentication/TLS, durable coordinator state, active RTT/bandwidth probing, native/WASI sandboxed executors, accelerator adapters, graph rewriting, and production-grade observability.
 
 ## Quick start
 
+Run all unit tests and the real multi-process smoke test:
+
 ```bash
 cargo test --workspace
-cargo run -p mosaic-cli -- demo
-cargo run -p mosaic-agent -- describe --id workstation-a --memory-gib 64 --performance 8
+./scripts/e2e-local.sh
 ```
+
+Inspect the original topology-aware scheduling demo:
+
+```bash
+cargo run -p mosaic-cli -- demo
+```
+
+For manual networked use, start a coordinator and one or more agents:
+
+```bash
+cargo run -p mosaic-coordinator -- --bind 127.0.0.1:8080
+cargo run -p mosaic-agent -- run \
+  --name worker-a \
+  --coordinator http://127.0.0.1:8080 \
+  --bind 127.0.0.1:8081 \
+  --advertise http://127.0.0.1:8081
+```
+
+The defaults bind to loopback. The current control plane is unauthenticated, so do not expose it to an untrusted network.
 
 ## Design invariants
 
@@ -77,6 +100,7 @@ cargo run -p mosaic-agent -- describe --id workstation-a --memory-gib 64 --perfo
 6. Fine-grained collectives are valid only inside a suitable latency domain.
 7. The runtime may change graph granularity, but not application-visible semantics.
 8. Hardware-specific execution remains backend-native; portability is provided at the task/state ABI boundary.
+9. Coordinator state, not a worker-provided timestamp, is authoritative for execution-lease validity.
 
 ## Documents
 
@@ -84,7 +108,7 @@ cargo run -p mosaic-agent -- describe --id workstation-a --memory-gib 64 --perfo
 - [Programming model](docs/programming-model.md)
 - [Scheduler](docs/scheduler.md)
 - [Failure and elasticity model](docs/failure-model.md)
-- [Protocol sketch](docs/protocol.md)
+- [Protocol](docs/protocol.md)
 - [Security and trust model](docs/security.md)
 - [Related systems](docs/related-work.md)
 - [Research plan](docs/research-plan.md)

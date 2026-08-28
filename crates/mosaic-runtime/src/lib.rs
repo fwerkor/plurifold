@@ -6,9 +6,10 @@ use mosaic_core::{
     ResourceId, TaskId, TaskSpec, TopologySnapshot,
 };
 use mosaic_scheduler::{PlacementDecision, ScheduleError, TopologyAwareScheduler};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum TaskStatus {
     Pending,
     Running(ExecutionLease),
@@ -37,6 +38,10 @@ pub enum FabricError {
     StaleResourceEpoch(ResourceId),
     #[error("task {0} does not exist")]
     UnknownTask(TaskId),
+    #[error("object {0} does not exist")]
+    UnknownObject(ObjectId),
+    #[error("object {0} conflicts with already published metadata")]
+    ObjectConflict(ObjectId),
     #[error("task {0} already exists")]
     DuplicateTask(TaskId),
     #[error("task {0} is not pending")]
@@ -81,6 +86,14 @@ impl Fabric {
 
     pub fn set_topology(&mut self, topology: TopologySnapshot) {
         self.topology = topology;
+    }
+
+    pub fn upsert_link(&mut self, link: mosaic_core::LinkProfile) {
+        self.topology.links.retain(|existing| {
+            !((existing.from == link.from && existing.to == link.to)
+                || (existing.from == link.to && existing.to == link.from))
+        });
+        self.topology.links.push(link);
     }
 
     pub fn register_resource(&mut self, mut descriptor: ResourceDescriptor) -> MembershipLease {
@@ -128,7 +141,7 @@ impl Fabric {
     }
 
     pub fn unregister_resource(&mut self, resource_id: ResourceId) {
-        self.resources.remove(&resource_id);
+        self.remove_resource(resource_id);
     }
 
     pub fn expire_resources_at(&mut self, unix_ms: u64) -> Vec<ResourceId> {
@@ -139,13 +152,54 @@ impl Fabric {
             .map(|(id, _)| *id)
             .collect();
         for id in &expired {
-            self.resources.remove(id);
+            self.remove_resource(*id);
         }
         expired
     }
 
-    pub fn publish_object(&mut self, object: ObjectMetadata) {
+    fn remove_resource(&mut self, resource_id: ResourceId) {
+        self.resources.remove(&resource_id);
+        for object in self.objects.values_mut() {
+            object.locations.retain(|location| *location != resource_id);
+        }
+        self.topology
+            .links
+            .retain(|link| link.from != resource_id && link.to != resource_id);
+    }
+
+    pub fn publish_object(&mut self, object: ObjectMetadata) -> Result<(), FabricError> {
+        if let Some(existing) = self.objects.get_mut(&object.id) {
+            if !same_object_identity(existing, &object) {
+                return Err(FabricError::ObjectConflict(object.id));
+            }
+            for location in object.locations {
+                if !existing.locations.contains(&location) {
+                    existing.locations.push(location);
+                }
+            }
+            return Ok(());
+        }
         self.objects.insert(object.id, object);
+        Ok(())
+    }
+
+    pub fn add_object_location(
+        &mut self,
+        object_id: ObjectId,
+        resource_id: ResourceId,
+    ) -> Result<(), FabricError> {
+        let object = self
+            .objects
+            .get_mut(&object_id)
+            .ok_or(FabricError::UnknownObject(object_id))?;
+        if !object.locations.contains(&resource_id) {
+            object.locations.push(resource_id);
+        }
+        Ok(())
+    }
+
+    pub fn object_metadata(&self, object_id: ObjectId) -> Option<&ObjectMetadata> {
+        self.objects.get(&object_id)
     }
 
     pub fn submit(&mut self, task: TaskSpec) -> Result<TaskId, FabricError> {
@@ -165,6 +219,34 @@ impl Fabric {
 
     pub fn task_status(&self, task_id: TaskId) -> Option<&TaskStatus> {
         self.tasks.get(&task_id).map(|record| &record.status)
+    }
+
+    pub fn task_spec(&self, task_id: TaskId) -> Option<&TaskSpec> {
+        self.tasks.get(&task_id).map(|record| &record.spec)
+    }
+
+    pub fn pending_task_ids(&self) -> Vec<TaskId> {
+        self.tasks
+            .iter()
+            .filter_map(|(id, record)| (record.status == TaskStatus::Pending).then_some(*id))
+            .collect()
+    }
+
+    pub fn active_resources(&self) -> Vec<ResourceDescriptor> {
+        let now = now_unix_ms();
+        self.resources
+            .values()
+            .filter(|resource| resource.expires_at_unix_ms > now)
+            .map(|resource| resource.descriptor.clone())
+            .collect()
+    }
+
+    pub fn resource_epoch(&self, resource_id: ResourceId) -> Option<u64> {
+        let now = now_unix_ms();
+        self.resources
+            .get(&resource_id)
+            .filter(|resource| resource.expires_at_unix_ms > now)
+            .map(|resource| resource.descriptor.epoch)
     }
 
     pub fn schedule_task(&self, task_id: TaskId) -> Result<PlacementDecision, FabricError> {
@@ -216,26 +298,90 @@ impl Fabric {
         Ok(lease)
     }
 
+    pub fn renew_execution(
+        &mut self,
+        lease: &ExecutionLease,
+    ) -> Result<ExecutionLease, FabricError> {
+        let now = now_unix_ms();
+        let resource = self
+            .resources
+            .get(&lease.resource_id)
+            .filter(|resource| resource.expires_at_unix_ms > now)
+            .ok_or(FabricError::ResourceNotActive(lease.resource_id))?;
+        if resource.descriptor.epoch != lease.resource_epoch {
+            return Err(FabricError::StaleResourceEpoch(lease.resource_id));
+        }
+
+        let record = self
+            .tasks
+            .get_mut(&lease.task_id)
+            .ok_or(FabricError::UnknownTask(lease.task_id))?;
+        let current = match &record.status {
+            TaskStatus::Running(current) if current.execution_id == lease.execution_id => current,
+            _ => return Err(FabricError::StaleExecution),
+        };
+        if current.expires_at_unix_ms <= now {
+            return Err(FabricError::ExecutionExpired);
+        }
+        if current.resource_id != lease.resource_id
+            || current.resource_epoch != lease.resource_epoch
+        {
+            return Err(FabricError::StaleExecution);
+        }
+
+        let renewed = ExecutionLease {
+            expires_at_unix_ms: now.saturating_add(self.execution_ttl_ms),
+            ..current.clone()
+        };
+        record.status = TaskStatus::Running(renewed.clone());
+        Ok(renewed)
+    }
+
     pub fn complete_execution(
         &mut self,
         lease: &ExecutionLease,
         outputs: Vec<ObjectMetadata>,
     ) -> Result<(), FabricError> {
-        if lease.expires_at_unix_ms <= now_unix_ms() {
-            return Err(FabricError::ExecutionExpired);
+        let now = now_unix_ms();
+        let resource = self
+            .resources
+            .get(&lease.resource_id)
+            .filter(|resource| resource.expires_at_unix_ms > now)
+            .ok_or(FabricError::ResourceNotActive(lease.resource_id))?;
+        if resource.descriptor.epoch != lease.resource_epoch {
+            return Err(FabricError::StaleResourceEpoch(lease.resource_id));
         }
         let record = self
             .tasks
-            .get_mut(&lease.task_id)
+            .get(&lease.task_id)
             .ok_or(FabricError::UnknownTask(lease.task_id))?;
         match &record.status {
-            TaskStatus::Running(current) if current.execution_id == lease.execution_id => {}
+            TaskStatus::Running(current) if current.execution_id == lease.execution_id => {
+                if current.expires_at_unix_ms <= now {
+                    return Err(FabricError::ExecutionExpired);
+                }
+                if current.resource_id != lease.resource_id
+                    || current.resource_epoch != lease.resource_epoch
+                {
+                    return Err(FabricError::StaleExecution);
+                }
+            }
             _ => return Err(FabricError::StaleExecution),
         }
+        for output in &outputs {
+            if let Some(existing) = self.objects.get(&output.id) {
+                if !same_object_identity(existing, output) {
+                    return Err(FabricError::ObjectConflict(output.id));
+                }
+            }
+        }
         let output_ids = outputs.iter().map(|object| object.id).collect();
-        record.status = TaskStatus::Completed(output_ids);
+        self.tasks
+            .get_mut(&lease.task_id)
+            .expect("task existence checked above")
+            .status = TaskStatus::Completed(output_ids);
         for object in outputs {
-            self.objects.insert(object.id, object);
+            self.publish_object(object)?;
         }
         Ok(())
     }
@@ -269,6 +415,14 @@ impl Fabric {
             .filter(|resource| resource.expires_at_unix_ms > now)
             .count()
     }
+}
+
+fn same_object_identity(left: &ObjectMetadata, right: &ObjectMetadata) -> bool {
+    left.id == right.id
+        && left.size_bytes == right.size_bytes
+        && left.digest == right.digest
+        && left.encoding == right.encoding
+        && left.producer == right.producer
 }
 
 fn now_unix_ms() -> u64 {
@@ -311,6 +465,7 @@ mod tests {
             id: TaskId::new(),
             artifact: "test".into(),
             entrypoint: "run".into(),
+            arguments: vec![],
             inputs: vec![],
             requirements: ResourceRequirements::default(),
             effects,
@@ -381,5 +536,89 @@ mod tests {
             fabric.task_status(task_id),
             Some(&TaskStatus::Completed(vec![output_id]))
         );
+    }
+
+    #[test]
+    fn old_resource_epoch_cannot_commit_after_reregistration() {
+        let mut fabric = Fabric::new(10_000, 10_000);
+        let worker = ResourceId::new();
+        fabric.register_resource(resource(worker));
+        let task = task(EffectSemantics::Pure);
+        let task_id = task.id;
+        fabric.submit(task).unwrap();
+        let stale_execution = fabric.begin_execution(task_id, worker).unwrap();
+
+        let new_membership = fabric.register_resource(resource(worker));
+        assert!(new_membership.epoch > stale_execution.resource_epoch);
+
+        let error = fabric
+            .complete_execution(&stale_execution, Vec::new())
+            .unwrap_err();
+        assert!(matches!(error, FabricError::StaleResourceEpoch(id) if id == worker));
+    }
+
+    #[test]
+    fn conflicting_object_publication_is_rejected() {
+        let mut fabric = Fabric::default();
+        let object_id = ObjectId::new();
+        let first = ObjectMetadata {
+            id: object_id,
+            size_bytes: 4,
+            digest: Some("sha256:first".into()),
+            encoding: Some("application/octet-stream".into()),
+            locations: vec![],
+            producer: None,
+        };
+        fabric.publish_object(first).unwrap();
+
+        let conflicting = ObjectMetadata {
+            id: object_id,
+            size_bytes: 5,
+            digest: Some("sha256:second".into()),
+            encoding: Some("application/octet-stream".into()),
+            locations: vec![],
+            producer: None,
+        };
+        let error = fabric.publish_object(conflicting).unwrap_err();
+        assert!(matches!(error, FabricError::ObjectConflict(id) if id == object_id));
+    }
+
+    #[test]
+    fn expired_resource_is_pruned_from_objects_and_topology() {
+        let mut fabric = Fabric::new(100, 10_000);
+        let expired = ResourceId::new();
+        let survivor = ResourceId::new();
+        let expired_lease = fabric.register_resource(resource(expired));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let survivor_lease = fabric.register_resource(resource(survivor));
+        assert!(survivor_lease.expires_at_unix_ms > expired_lease.expires_at_unix_ms);
+
+        let object_id = ObjectId::new();
+        fabric
+            .publish_object(ObjectMetadata {
+                id: object_id,
+                size_bytes: 4,
+                digest: Some("sha256:test".into()),
+                encoding: None,
+                locations: vec![expired, survivor],
+                producer: None,
+            })
+            .unwrap();
+        fabric.set_topology(TopologySnapshot {
+            links: vec![mosaic_core::LinkProfile {
+                from: expired,
+                to: survivor,
+                rtt_ms: 10.0,
+                bandwidth_mbps: 100.0,
+            }],
+        });
+
+        fabric.expire_resources_at(expired_lease.expires_at_unix_ms);
+
+        assert_eq!(
+            fabric.object_metadata(object_id).unwrap().locations,
+            vec![survivor]
+        );
+        assert!(fabric.topology.links.is_empty());
     }
 }

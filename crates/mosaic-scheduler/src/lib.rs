@@ -185,6 +185,7 @@ mod tests {
             id: TaskId::new(),
             artifact: "demo".into(),
             entrypoint: "run".into(),
+            arguments: vec![],
             inputs: vec![input],
             requirements: ResourceRequirements::default(),
             effects: EffectSemantics::Pure,
