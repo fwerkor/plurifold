@@ -29,7 +29,7 @@ Cooperative Job
 
 ### Logical planner
 
-A `LogicalJobSpec` keeps the role/dependency graph explicit but allows each role to advertise multiple Task implementations. A snapshot planner can preview a concrete `CooperativeJobSpec`, but v0.5 logical execution keeps the alternatives live instead of treating that preview as the execution contract.
+A `LogicalJobSpec` keeps the role/dependency graph explicit but allows each role to advertise multiple Task implementations. A snapshot planner can preview a concrete `CooperativeJobSpec`, but v0.6 logical execution keeps the alternatives live instead of treating that preview as the execution contract.
 
 For each ready role it scores implementation/resource pairs with the ordinary topology-aware scheduler. Predicted predecessor outputs are represented as temporary planning objects located at the chosen predecessor resources, with size derived from the selected implementation's output-size hint. This lets a downstream choice account for the communication cost created by upstream choices instead of selecting every role independently.
 
@@ -98,6 +98,8 @@ The topology model classifies links by observed RTT/bandwidth rather than admini
 | L5 | >= 200 ms | batch, replication, disconnected-tolerant work |
 
 These thresholds are policy defaults, not correctness rules. Runtime measurements can override them.
+
+In v0.6 the link graph is maintained from active peer probes rather than requiring topology to be injected manually. Agents measure peer RTT and bounded practical HTTP throughput in the background without blocking heartbeats or work polling. Failed probes withdraw automatic links. Explicit operator links remain authoritative overrides. This still assumes the advertised peer endpoints are directly routable; relay/NAT traversal is a separate transport problem.
 
 ## 4. Control plane vs data plane
 

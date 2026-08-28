@@ -50,8 +50,8 @@
 
 ## Phase 3 — Topology and graph adaptation
 
-- [ ] active RTT/bandwidth probing
-- [ ] peer link graph maintenance and latency domains from live measurements
+- [x] active RTT/bandwidth probing
+- [x] peer link graph maintenance and latency domains from live measurements
 - [ ] automatic batching/fusion
 - [ ] speculative replication
 - [ ] checkpoint-aware migration

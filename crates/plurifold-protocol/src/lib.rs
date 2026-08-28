@@ -137,6 +137,21 @@ pub struct LinkUpdateRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReportLinkMeasurementRequest {
+    pub reporter_resource_id: ResourceId,
+    pub reporter_epoch: u64,
+    pub peer_resource_id: ResourceId,
+    pub measurement: LinkMeasurement,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum LinkMeasurement {
+    Reachable { rtt_ms: f64, bandwidth_mbps: f64 },
+    Unreachable,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PutObjectResponse {
     pub object: ObjectMetadata,
 }

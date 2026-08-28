@@ -92,6 +92,7 @@ wait_http "$COORD/healthz"
   --store-dir "$TMP/a" \
   --heartbeat-interval-ms 150 \
   --poll-interval-ms 50 \
+  --probe-interval-ms 100 \
   >"$TMP/worker-a.log" 2>&1 &
 A_PID=$!
 PIDS+=("$A_PID")
@@ -106,6 +107,7 @@ PIDS+=("$A_PID")
   --store-dir "$TMP/b" \
   --heartbeat-interval-ms 150 \
   --poll-interval-ms 50 \
+  --probe-interval-ms 100 \
   >"$TMP/worker-b.log" 2>&1 &
 B_PID=$!
 PIDS+=("$B_PID")
@@ -124,11 +126,6 @@ done
 [[ "${COUNT:-0}" == "2" ]]
 A_ID=$(printf '%s' "$RESOURCES" | json_resource_id worker-a)
 B_ID=$(printf '%s' "$RESOURCES" | json_resource_id worker-b)
-
-./target/debug/plurifold link \
-  --coordinator "$COORD" \
-  --from "$A_ID" --to "$B_ID" \
-  --rtt-ms 80 --bandwidth-mbps 100
 
 printf 'hello-' >"$TMP/input-a"
 printf 'fabric\n' >"$TMP/input-b"
@@ -441,6 +438,7 @@ done
   --store-dir "$TMP/c" \
   --heartbeat-interval-ms 150 \
   --poll-interval-ms 50 \
+  --probe-interval-ms 100 \
   >"$TMP/worker-c.log" 2>&1 &
 C_PID=$!
 PIDS+=("$C_PID")
@@ -457,9 +455,6 @@ done
 [[ "${COUNT:-0}" == "3" ]]
 C_ID=$(printf '%s' "$RESOURCES" | json_resource_id worker-c)
 
-./target/debug/plurifold link --coordinator "$COORD" --from "$A_ID" --to "$C_ID" --rtt-ms 1 --bandwidth-mbps 10000
-./target/debug/plurifold link --coordinator "$COORD" --from "$B_ID" --to "$C_ID" --rtt-ms 1 --bandwidth-mbps 10000
-
 ./target/debug/plurifold job wait --coordinator "$COORD" --job "$AUTO_JOB" --timeout-s 10 >/dev/null
 AUTO_EXPECTED=$(printf 'auto-left|auto-right\n' | sha256sum | awk '{print $1}')
 [[ -f "$TMP/c/sha256/$AUTO_EXPECTED" ]]
@@ -470,7 +465,7 @@ join=next(role for role in data["roles"] if role["name"] == "join")
 assert join["implementation"] == "join-fast", join
 assert join["planned_resource"] == sys.argv[1], join
 ' "$C_ID"
-echo "dynamic-replan: ok (preview join-left->$A_ID, ready-time join-fast->$C_ID after hot join)"
+echo "dynamic-replan: ok (automatic topology; preview join-left->$A_ID, ready-time join-fast->$C_ID after hot join)"
 
 kill "$C_PID"
 C_PID=0

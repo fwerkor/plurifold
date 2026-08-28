@@ -740,7 +740,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "plurifold-agent"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "axum",
  "bytes",
@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "plurifold-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "clap",
  "plurifold-core",
@@ -771,7 +771,7 @@ dependencies = [
 
 [[package]]
 name = "plurifold-coordinator"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "axum",
  "clap",
@@ -786,7 +786,7 @@ dependencies = [
 
 [[package]]
 name = "plurifold-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "serde",
  "uuid",
@@ -794,7 +794,7 @@ dependencies = [
 
 [[package]]
 name = "plurifold-protocol"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "plurifold-core",
  "plurifold-runtime",
@@ -803,7 +803,7 @@ dependencies = [
 
 [[package]]
 name = "plurifold-runtime"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "plurifold-core",
  "plurifold-scheduler",
@@ -813,7 +813,7 @@ dependencies = [
 
 [[package]]
 name = "plurifold-scheduler"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "plurifold-core",
  "thiserror",
@@ -821,7 +821,7 @@ dependencies = [
 
 [[package]]
 name = "plurifold-store"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "hex",
  "sha2",

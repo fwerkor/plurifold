@@ -147,11 +147,19 @@ impl Fabric {
     }
 
     pub fn upsert_link(&mut self, link: plurifold_core::LinkProfile) {
-        self.topology.links.retain(|existing| {
-            !((existing.from == link.from && existing.to == link.to)
-                || (existing.from == link.to && existing.to == link.from))
-        });
+        self.remove_link(link.from, link.to);
         self.topology.links.push(link);
+    }
+
+    pub fn remove_link(&mut self, from: ResourceId, to: ResourceId) {
+        self.topology.links.retain(|existing| {
+            !((existing.from == from && existing.to == to)
+                || (existing.from == to && existing.to == from))
+        });
+    }
+
+    pub fn topology(&self) -> &TopologySnapshot {
+        &self.topology
     }
 
     pub fn register_resource(&mut self, mut descriptor: ResourceDescriptor) -> MembershipLease {

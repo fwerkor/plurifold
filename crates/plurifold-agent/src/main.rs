@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
@@ -16,13 +16,18 @@ use plurifold_core::{
     Architecture, MembershipLease, ObjectId, ObjectMetadata, ResourceDescriptor, ResourceId,
 };
 use plurifold_protocol::{
-    CompleteExecutionRequest, ErrorResponse, HeartbeatRequest, PutObjectResponse,
+    CompleteExecutionRequest, ErrorResponse, HeartbeatRequest, LinkMeasurement, PutObjectResponse,
     RegisterReplicaRequest, RegisterResourceRequest, RegisterResourceResponse,
-    RenewExecutionRequest, ResolvedObject, WorkAssignment, WorkPollRequest, WorkPollResponse,
+    RenewExecutionRequest, ReportLinkMeasurementRequest, ResolvedObject, ResourceListResponse,
+    WorkAssignment, WorkPollRequest, WorkPollResponse,
 };
 use plurifold_store::LocalObjectStore;
 use reqwest::Client;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+const PROBE_BYTES: usize = 256 * 1024;
+const MAX_PROBE_BYTES: usize = 1024 * 1024;
+const RTT_PROBE_SAMPLES: usize = 3;
 
 #[derive(Parser)]
 #[command(name = "plurifold-agent", about = "Plurifold resource agent")]
@@ -51,6 +56,8 @@ enum Command {
         heartbeat_interval_ms: u64,
         #[arg(long, default_value_t = 200)]
         poll_interval_ms: u64,
+        #[arg(long, default_value_t = 30_000)]
+        probe_interval_ms: u64,
     },
 }
 
@@ -72,6 +79,13 @@ struct ResourceArgs {
 struct DataState {
     store: LocalObjectStore,
     resource_id: ResourceId,
+}
+
+#[derive(Clone, Copy)]
+struct WorkerPeriods {
+    heartbeat: Duration,
+    poll: Duration,
+    probe: Duration,
 }
 
 #[tokio::main]
@@ -98,6 +112,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             store_dir,
             heartbeat_interval_ms,
             poll_interval_ms,
+            probe_interval_ms,
         } => {
             let resource_id = ResourceId::new();
             let store = LocalObjectStore::new(store_dir)?;
@@ -120,8 +135,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 advertise,
                 descriptor(resource_id, &resource),
                 store,
-                Duration::from_millis(heartbeat_interval_ms.max(50)),
-                Duration::from_millis(poll_interval_ms.max(20)),
+                WorkerPeriods {
+                    heartbeat: Duration::from_millis(heartbeat_interval_ms.max(50)),
+                    poll: Duration::from_millis(poll_interval_ms.max(20)),
+                    probe: Duration::from_millis(probe_interval_ms.max(50)),
+                },
             )
             .await?;
         }
@@ -156,15 +174,17 @@ async fn run_worker(
     data_endpoint: String,
     descriptor: ResourceDescriptor,
     store: LocalObjectStore,
-    heartbeat_period: Duration,
-    poll_period: Duration,
+    periods: WorkerPeriods,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut lease = register(&client, &coordinator, &data_endpoint, &descriptor).await?;
     info!(resource_id = %lease.resource_id, epoch = lease.epoch, "joined fabric");
 
     let busy = Arc::new(AtomicBool::new(false));
-    let mut heartbeat = tokio::time::interval(heartbeat_period);
-    let mut poll = tokio::time::interval(poll_period);
+    let probing = Arc::new(AtomicBool::new(false));
+    let mut heartbeat = tokio::time::interval(periods.heartbeat);
+    let mut poll = tokio::time::interval(periods.poll);
+    let mut probe = tokio::time::interval(periods.probe);
+    probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -205,6 +225,20 @@ async fn run_worker(
                     }
                     Ok(None) => {}
                     Err(error) => warn!(%error, "work poll failed"),
+                }
+            }
+            _ = probe.tick() => {
+                if !probing.swap(true, Ordering::AcqRel) {
+                    let client = client.clone();
+                    let coordinator = coordinator.clone();
+                    let lease = lease.clone();
+                    let probing = probing.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = discover_topology(&client, &coordinator, &lease).await {
+                            debug!(%error, "topology discovery pass failed");
+                        }
+                        probing.store(false, Ordering::Release);
+                    });
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -269,6 +303,100 @@ async fn poll_work(
     parse_json::<WorkPollResponse>(response)
         .await
         .map(|response| response.assignment)
+}
+
+async fn discover_topology(
+    client: &Client,
+    coordinator: &str,
+    lease: &MembershipLease,
+) -> Result<(), String> {
+    let response = client
+        .get(format!("{coordinator}/v1/resources"))
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    let resources: ResourceListResponse = parse_json(response).await?;
+
+    let self_key = lease.resource_id.to_string();
+    for peer in resources.resources {
+        if peer.descriptor.id == lease.resource_id || self_key >= peer.descriptor.id.to_string() {
+            continue;
+        }
+        let Some(endpoint) = peer.data_endpoint else {
+            continue;
+        };
+        let measurement = match measure_peer(client, &endpoint).await {
+            Ok((rtt_ms, bandwidth_mbps)) => LinkMeasurement::Reachable {
+                rtt_ms,
+                bandwidth_mbps,
+            },
+            Err(error) => {
+                debug!(peer = %peer.descriptor.id, %error, "peer topology probe failed");
+                LinkMeasurement::Unreachable
+            }
+        };
+        report_link_measurement(client, coordinator, lease, peer.descriptor.id, measurement)
+            .await?;
+    }
+    Ok(())
+}
+
+async fn report_link_measurement(
+    client: &Client,
+    coordinator: &str,
+    lease: &MembershipLease,
+    peer_resource_id: ResourceId,
+    measurement: LinkMeasurement,
+) -> Result<(), String> {
+    let response = client
+        .post(format!("{coordinator}/v1/topology/measurement"))
+        .json(&ReportLinkMeasurementRequest {
+            reporter_resource_id: lease.resource_id,
+            reporter_epoch: lease.epoch,
+            peer_resource_id,
+            measurement,
+        })
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    expect_success(response).await
+}
+
+async fn measure_peer(client: &Client, endpoint: &str) -> Result<(f64, f64), String> {
+    let endpoint = endpoint.trim_end_matches('/');
+    let mut rtt_ms = f64::INFINITY;
+    for _ in 0..RTT_PROBE_SAMPLES {
+        let elapsed = fetch_probe(client, endpoint, 0).await?;
+        rtt_ms = rtt_ms.min(elapsed.as_secs_f64() * 1_000.0);
+    }
+
+    let elapsed = fetch_probe(client, endpoint, PROBE_BYTES).await?;
+    let payload_elapsed_ms = (elapsed.as_secs_f64() * 1_000.0 - rtt_ms).max(0.1);
+    let bandwidth_mbps = PROBE_BYTES as f64 * 8.0 / payload_elapsed_ms / 1_000.0;
+    Ok((rtt_ms, bandwidth_mbps))
+}
+
+async fn fetch_probe(client: &Client, endpoint: &str, bytes: usize) -> Result<Duration, String> {
+    let started = Instant::now();
+    let response = client
+        .get(format!("{endpoint}/v1/probe/{bytes}"))
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(response_error(response).await);
+    }
+    let body = response.bytes().await.map_err(|error| error.to_string())?;
+    if body.len() != bytes {
+        return Err(format!(
+            "probe returned {} bytes, expected {bytes}",
+            body.len()
+        ));
+    }
+    Ok(started.elapsed())
 }
 
 async fn execute_and_commit(
@@ -448,9 +576,19 @@ async fn execute_builtin(
 fn data_router(state: DataState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { StatusCode::NO_CONTENT }))
+        .route("/v1/probe/{bytes}", get(probe_bytes))
         .route("/v1/objects", post(put_object))
         .route("/v1/blobs/{digest}", get(get_blob))
         .with_state(state)
+}
+
+async fn probe_bytes(Path(bytes): Path<usize>) -> Result<Bytes, DataError> {
+    if bytes > MAX_PROBE_BYTES {
+        return Err(DataError::bad_request(format!(
+            "probe payload cannot exceed {MAX_PROBE_BYTES} bytes"
+        )));
+    }
+    Ok(Bytes::from(vec![0; bytes]))
 }
 
 async fn put_object(
@@ -529,6 +667,13 @@ struct DataError {
 }
 
 impl DataError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
     fn internal(error: impl std::fmt::Display) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,

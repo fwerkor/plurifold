@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,13 +10,13 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use plurifold_core::{JobId, ObjectId, ResourceId, TaskId};
 use plurifold_protocol::{
-    CompleteExecutionRequest, CooperativeJobView, ErrorResponse, HeartbeatRequest,
+    CompleteExecutionRequest, CooperativeJobView, ErrorResponse, HeartbeatRequest, LinkMeasurement,
     LinkUpdateRequest, ObjectReplica, PlanLogicalJobRequest, PublishObjectRequest,
     RegisterReplicaRequest, RegisterResourceRequest, RegisterResourceResponse,
-    RenewExecutionRequest, ResolvedObject, ResourceListResponse, ResourceView,
-    SubmitCooperativeJobRequest, SubmitCooperativeJobResponse, SubmitLogicalJobResponse,
-    SubmitTaskRequest, SubmitTaskResponse, TaskView, WorkAssignment, WorkPollRequest,
-    WorkPollResponse,
+    RenewExecutionRequest, ReportLinkMeasurementRequest, ResolvedObject, ResourceListResponse,
+    ResourceView, SubmitCooperativeJobRequest, SubmitCooperativeJobResponse,
+    SubmitLogicalJobResponse, SubmitTaskRequest, SubmitTaskResponse, TaskView, WorkAssignment,
+    WorkPollRequest, WorkPollResponse,
 };
 use plurifold_runtime::{CooperativePlan, Fabric, FabricError, PlanError};
 use tokio::sync::Mutex;
@@ -29,6 +29,7 @@ pub struct Coordinator {
 struct CoordinatorState {
     fabric: Fabric,
     data_endpoints: HashMap<ResourceId, String>,
+    manual_links: HashSet<(ResourceId, ResourceId)>,
 }
 
 impl Coordinator {
@@ -37,6 +38,7 @@ impl Coordinator {
             inner: Arc::new(Mutex::new(CoordinatorState {
                 fabric: Fabric::new(membership_ttl_ms, execution_ttl_ms),
                 data_endpoints: HashMap::new(),
+                manual_links: HashSet::new(),
             })),
         }
     }
@@ -59,6 +61,7 @@ impl Coordinator {
             .route("/v1/jobs/auto", post(submit_planned_job))
             .route("/v1/jobs/{job_id}", get(get_cooperative_job))
             .route("/v1/topology/link", post(update_link))
+            .route("/v1/topology/measurement", post(report_link_measurement))
             .with_state(self)
     }
 
@@ -68,6 +71,9 @@ impl Coordinator {
         let expired = state.fabric.expire_resources_at(now);
         for resource_id in expired {
             state.data_endpoints.remove(&resource_id);
+            state
+                .manual_links
+                .retain(|(from, to)| *from != resource_id && *to != resource_id);
         }
         state.fabric.reap_expired_executions_at(now);
     }
@@ -361,14 +367,82 @@ async fn update_link(
     State(coordinator): State<Coordinator>,
     Json(request): Json<LinkUpdateRequest>,
 ) -> Result<StatusCode, ApiError> {
-    if request.link.rtt_ms < 0.0 || request.link.bandwidth_mbps <= 0.0 {
-        return Err(ApiError::bad_request(
-            "link requires non-negative RTT and positive bandwidth",
-        ));
-    }
+    validate_link(&request.link)?;
     let mut state = coordinator.inner.lock().await;
+    state
+        .manual_links
+        .insert((request.link.from, request.link.to));
     state.fabric.upsert_link(request.link);
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn report_link_measurement(
+    State(coordinator): State<Coordinator>,
+    Json(request): Json<ReportLinkMeasurementRequest>,
+) -> Result<StatusCode, ApiError> {
+    if request.reporter_resource_id == request.peer_resource_id {
+        return Err(ApiError::bad_request("link endpoints must be different"));
+    }
+
+    let mut state = coordinator.inner.lock().await;
+    let current_epoch = state
+        .fabric
+        .resource_epoch(request.reporter_resource_id)
+        .ok_or_else(|| ApiError::not_found("reporter resource is not active"))?;
+    if current_epoch != request.reporter_epoch {
+        return Err(ApiError::conflict("reporter resource epoch is stale"));
+    }
+    if state
+        .fabric
+        .resource_epoch(request.peer_resource_id)
+        .is_none()
+    {
+        return Err(ApiError::not_found("peer resource is not active"));
+    }
+    if state
+        .manual_links
+        .contains(&(request.reporter_resource_id, request.peer_resource_id))
+        || state
+            .manual_links
+            .contains(&(request.peer_resource_id, request.reporter_resource_id))
+    {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    match request.measurement {
+        LinkMeasurement::Reachable {
+            rtt_ms,
+            bandwidth_mbps,
+        } => {
+            let link = plurifold_core::LinkProfile {
+                from: request.reporter_resource_id,
+                to: request.peer_resource_id,
+                rtt_ms,
+                bandwidth_mbps,
+            };
+            validate_link(&link)?;
+            state.fabric.upsert_link(link);
+        }
+        LinkMeasurement::Unreachable => state
+            .fabric
+            .remove_link(request.reporter_resource_id, request.peer_resource_id),
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn validate_link(link: &plurifold_core::LinkProfile) -> Result<(), ApiError> {
+    if link.from == link.to {
+        return Err(ApiError::bad_request("link endpoints must be different"));
+    }
+    if !link.rtt_ms.is_finite()
+        || !link.bandwidth_mbps.is_finite()
+        || link.rtt_ms < 0.0
+        || link.bandwidth_mbps <= 0.0
+    {
+        return Err(ApiError::bad_request(
+            "link requires finite non-negative RTT and finite positive bandwidth",
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_endpoint(endpoint: &str) -> Result<String, ApiError> {
@@ -462,5 +536,154 @@ impl IntoResponse for ApiError {
             }),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use plurifold_core::{Architecture, LinkProfile, ResourceDescriptor};
+
+    use super::*;
+
+    fn resource(id: ResourceId) -> ResourceDescriptor {
+        ResourceDescriptor {
+            id,
+            epoch: 0,
+            architecture: Architecture::X86_64,
+            cpu_cores: 8,
+            memory_bytes: 16 << 30,
+            accelerators: vec![],
+            features: BTreeSet::new(),
+            performance_score: 1.0,
+            queue_delay_ms: 0.0,
+            startup_delay_ms: 0.0,
+            failure_probability: 0.0,
+        }
+    }
+
+    async fn register_pair(
+        coordinator: &Coordinator,
+    ) -> (plurifold_core::MembershipLease, ResourceId) {
+        let first = ResourceId::new();
+        let second = ResourceId::new();
+        let mut state = coordinator.inner.lock().await;
+        let first_lease = state.fabric.register_resource(resource(first));
+        state.fabric.register_resource(resource(second));
+        (first_lease, second)
+    }
+
+    #[tokio::test]
+    async fn manual_link_is_not_overwritten_by_automatic_measurement() {
+        let coordinator = Coordinator::new(10_000, 10_000);
+        let (reporter, peer) = register_pair(&coordinator).await;
+        let manual = LinkProfile {
+            from: reporter.resource_id,
+            to: peer,
+            rtt_ms: 80.0,
+            bandwidth_mbps: 100.0,
+        };
+        assert!(update_link(
+            State(coordinator.clone()),
+            Json(LinkUpdateRequest {
+                link: manual.clone(),
+            }),
+        )
+        .await
+        .is_ok());
+
+        assert!(report_link_measurement(
+            State(coordinator.clone()),
+            Json(ReportLinkMeasurementRequest {
+                reporter_resource_id: reporter.resource_id,
+                reporter_epoch: reporter.epoch,
+                peer_resource_id: peer,
+                measurement: LinkMeasurement::Unreachable,
+            }),
+        )
+        .await
+        .is_ok());
+
+        let state = coordinator.inner.lock().await;
+        assert_eq!(
+            state.fabric.topology().link(reporter.resource_id, peer),
+            Some(&manual)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_reporter_cannot_update_automatic_topology() {
+        let coordinator = Coordinator::new(10_000, 10_000);
+        let (reporter, peer) = register_pair(&coordinator).await;
+        let error = report_link_measurement(
+            State(coordinator.clone()),
+            Json(ReportLinkMeasurementRequest {
+                reporter_resource_id: reporter.resource_id,
+                reporter_epoch: reporter.epoch + 1,
+                peer_resource_id: peer,
+                measurement: LinkMeasurement::Reachable {
+                    rtt_ms: 1.0,
+                    bandwidth_mbps: 1_000.0,
+                },
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        let state = coordinator.inner.lock().await;
+        assert!(state
+            .fabric
+            .topology()
+            .link(reporter.resource_id, peer)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn unreachable_measurement_withdraws_automatic_link() {
+        let coordinator = Coordinator::new(10_000, 10_000);
+        let (reporter, peer) = register_pair(&coordinator).await;
+        assert!(report_link_measurement(
+            State(coordinator.clone()),
+            Json(ReportLinkMeasurementRequest {
+                reporter_resource_id: reporter.resource_id,
+                reporter_epoch: reporter.epoch,
+                peer_resource_id: peer,
+                measurement: LinkMeasurement::Reachable {
+                    rtt_ms: 2.0,
+                    bandwidth_mbps: 500.0,
+                },
+            }),
+        )
+        .await
+        .is_ok());
+        {
+            let state = coordinator.inner.lock().await;
+            assert!(state
+                .fabric
+                .topology()
+                .link(reporter.resource_id, peer)
+                .is_some());
+        }
+
+        assert!(report_link_measurement(
+            State(coordinator.clone()),
+            Json(ReportLinkMeasurementRequest {
+                reporter_resource_id: reporter.resource_id,
+                reporter_epoch: reporter.epoch,
+                peer_resource_id: peer,
+                measurement: LinkMeasurement::Unreachable,
+            }),
+        )
+        .await
+        .is_ok());
+
+        let state = coordinator.inner.lock().await;
+        assert!(state
+            .fabric
+            .topology()
+            .link(reporter.resource_id, peer)
+            .is_none());
     }
 }

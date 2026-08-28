@@ -1,6 +1,6 @@
 # Protocol
 
-Plurifold v0.5 uses a deliberately small **HTTP/JSON control plane** (protocol constant `API_VERSION = 2`). The Rust request/response types in `plurifold-protocol` are authoritative for the current prototype. `proto/plurifold.proto` remains a transport-neutral design sketch for a possible future binary RPC encoding; it is not generated into the build.
+Plurifold v0.6 uses a deliberately small **HTTP/JSON control plane** (protocol constant `API_VERSION = 2`). The Rust request/response types in `plurifold-protocol` are authoritative for the current prototype. `proto/plurifold.proto` remains a transport-neutral design sketch for a possible future binary RPC encoding; it is not generated into the build.
 
 ## Membership
 
@@ -44,16 +44,19 @@ If a lease expires, replay-safe work returns to `Pending`. An `Exclusive` task i
 
 Object metadata is published to `POST /v1/objects/publish`. When an agent fetches an existing object into its local cache, it records the new physical replica through `POST /v1/objects/replica`.
 
-Bulk bytes do **not** pass through the coordinator. In v0.5 each agent exposes:
+Bulk object bytes do **not** pass through the coordinator. In v0.6 each agent exposes:
 
 - `POST /v1/objects` — stage bytes into the local SHA-256 CAS and create logical object metadata;
 - `GET /v1/blobs/{sha256}` — serve immutable bytes directly to another agent.
+- `GET /v1/probe/{bytes}` — serve a bounded synthetic payload for peer RTT/throughput measurement (maximum 1 MiB).
 
 The receiving agent recomputes the SHA-256 digest before using the object. The transport can therefore be replaced later by HTTP range transfer, object storage, RDMA/site-local paths, or relays without changing logical object identity.
 
 ## Topology
 
-The prototype accepts measured links at `POST /v1/topology/link`. Links carry RTT and bandwidth. Active measurement is intentionally a later phase; scheduling never invents reachability for a missing link.
+Agents periodically reuse `GET /v1/resources` to discover peer data endpoints. One agent per unordered peer pair performs three empty-response RTT probes and a 256 KiB payload probe, then reports the observed reachability through `POST /v1/topology/measurement`. Reports carry the reporter Resource ID and epoch; stale or inactive reporters are rejected. Successful reports install/update the measured `LinkProfile`; an `Unreachable` report withdraws the automatic link so scheduling does not keep using stale reachability.
+
+`POST /v1/topology/link` remains an explicit operator override. A manual link is authoritative for that Resource pair until one endpoint expires; automatic measurements neither overwrite nor withdraw it.
 
 ## Current endpoint summary
 
@@ -74,10 +77,11 @@ The prototype accepts measured links at `POST /v1/topology/link`. Links carry RT
 | `POST /v1/jobs/plan` | preview implementation choices and predicted placements for a logical job |
 | `POST /v1/jobs/auto` | submit a logical job for ready-time implementation replanning |
 | `GET /v1/jobs/{id}` | inspect cooperative job and role states |
-| `POST /v1/topology/link` | update measured link |
+| `POST /v1/topology/link` | set a manual link override |
+| `POST /v1/topology/measurement` | report automatic peer reachability/RTT/bandwidth |
 
 ## Compatibility and security
 
 Resource capabilities and task features use extensible string identifiers where premature closed enums would block new accelerator/runtime types. Wire-version negotiation and backward compatibility are not implemented yet.
 
-The v0.5 service is **unauthenticated** and defaults to loopback. Cross-trust-domain authentication, authorization, TLS, signed artifacts, and secret locality are design requirements in `security.md`, not claims of the current implementation.
+The v0.6 service is **unauthenticated** and defaults to loopback. Cross-trust-domain authentication, authorization, TLS, signed artifacts, and secret locality are design requirements in `security.md`, not claims of the current implementation.
