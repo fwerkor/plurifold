@@ -1,16 +1,16 @@
-# Mosaic Fabric
+# Plurifold
 
-Mosaic Fabric is an experimental runtime for **elastic heterogeneous computing across weakly connected resources**. It targets CPUs, GPUs, NPUs, accelerators, edge devices, workstations, clusters, and cloud instances that may differ in architecture and performance, may be separated by WAN links, and may join or leave while an application is running.
+Plurifold is an experimental runtime for **elastic heterogeneous computing across weakly connected resources**. It targets CPUs, GPUs, NPUs, accelerators, edge devices, workstations, clusters, and cloud instances that may differ in architecture and performance, may be separated by WAN links, and may join or leave while an application is running.
 
 The central rule is:
 
 > **Location-transparent programming, topology-aware execution.**
 
-Mosaic does not pretend that a 150 ms WAN link is shared memory. Applications describe tasks, objects, state, and execution constraints. The runtime keeps network topology, data locality, accelerator capabilities, failure risk, and startup cost as first-class scheduling inputs.
+Plurifold does not pretend that a 150 ms WAN link is shared memory. Applications describe tasks, objects, state, and execution constraints. The runtime keeps network topology, data locality, accelerator capabilities, failure risk, and startup cost as first-class scheduling inputs.
 
 ## Why another runtime?
 
-Existing systems solve important parts of this problem: Legion provides a data-centric programming model, StarPU schedules heterogeneous tasks and data movement, Ray provides tasks/actors/objects and fault tolerance, Charm++ supports migratable objects, Globus Compute spans administrative domains, and WASI provides a portable component ABI. Mosaic explores the missing composition of these ideas for **highly heterogeneous, dynamically changing, weakly connected compute**.
+Existing systems solve important parts of this problem: Legion provides a data-centric programming model, StarPU schedules heterogeneous tasks and data movement, Ray provides tasks/actors/objects and fault tolerance, Charm++ supports migratable objects, Globus Compute spans administrative domains, and WASI provides a portable component ABI. Plurifold explores the missing composition of these ideas for **highly heterogeneous, dynamically changing, weakly connected compute**.
 
 The research hypothesis is that useful global scheduling requires more than placement. A WAN-aware runtime should be able to adapt **computation granularity** by batching, fusing, replicating, migrating, and checkpointing work according to communication/computation ratio.
 
@@ -74,14 +74,14 @@ cargo test --workspace
 Inspect the original topology-aware scheduling demo:
 
 ```bash
-cargo run -p mosaic-cli -- demo
+cargo run -p plurifold-cli -- demo
 ```
 
 For manual networked use, start a coordinator and one or more agents:
 
 ```bash
-cargo run -p mosaic-coordinator -- --bind 127.0.0.1:8080
-cargo run -p mosaic-agent -- run \
+cargo run -p plurifold-coordinator -- --bind 127.0.0.1:8080
+cargo run -p plurifold-agent -- run \
   --name worker-a \
   --coordinator http://127.0.0.1:8080 \
   --bind 127.0.0.1:8081 \

@@ -8,7 +8,7 @@ A useful runtime for weakly connected heterogeneous compute must jointly reason 
 
 ### RQ1 — Can topology-aware placement turn stranded heterogeneous resources into useful throughput?
 
-Compare Mosaic against locality-oblivious and compute-only schedulers over controlled CPU/GPU/NPU mixtures and WAN emulation. Measure makespan, useful compute utilization, transferred bytes, idle time, and scheduler overhead.
+Compare Plurifold against locality-oblivious and compute-only schedulers over controlled CPU/GPU/NPU mixtures and WAN emulation. Measure makespan, useful compute utilization, transferred bytes, idle time, and scheduler overhead.
 
 ### RQ2 — Does adaptive graph granularity outperform placement-only scheduling under high RTT?
 

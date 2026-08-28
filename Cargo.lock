@@ -706,97 +706,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mosaic-agent"
-version = "0.2.0"
-dependencies = [
- "axum",
- "bytes",
- "clap",
- "mosaic-core",
- "mosaic-protocol",
- "mosaic-store",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "mosaic-cli"
-version = "0.2.0"
-dependencies = [
- "clap",
- "mosaic-core",
- "mosaic-protocol",
- "mosaic-runtime",
- "reqwest",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "mosaic-coordinator"
-version = "0.2.0"
-dependencies = [
- "axum",
- "clap",
- "mosaic-core",
- "mosaic-protocol",
- "mosaic-runtime",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "mosaic-core"
-version = "0.2.0"
-dependencies = [
- "serde",
- "uuid",
-]
-
-[[package]]
-name = "mosaic-protocol"
-version = "0.2.0"
-dependencies = [
- "mosaic-core",
- "mosaic-runtime",
- "serde",
-]
-
-[[package]]
-name = "mosaic-runtime"
-version = "0.2.0"
-dependencies = [
- "mosaic-core",
- "mosaic-scheduler",
- "serde",
- "thiserror",
-]
-
-[[package]]
-name = "mosaic-scheduler"
-version = "0.2.0"
-dependencies = [
- "mosaic-core",
- "thiserror",
-]
-
-[[package]]
-name = "mosaic-store"
-version = "0.2.0"
-dependencies = [
- "hex",
- "sha2",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -828,6 +737,97 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "plurifold-agent"
+version = "0.2.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "clap",
+ "plurifold-core",
+ "plurifold-protocol",
+ "plurifold-store",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "plurifold-cli"
+version = "0.2.0"
+dependencies = [
+ "clap",
+ "plurifold-core",
+ "plurifold-protocol",
+ "plurifold-runtime",
+ "reqwest",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "plurifold-coordinator"
+version = "0.2.0"
+dependencies = [
+ "axum",
+ "clap",
+ "plurifold-core",
+ "plurifold-protocol",
+ "plurifold-runtime",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "plurifold-core"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "plurifold-protocol"
+version = "0.2.0"
+dependencies = [
+ "plurifold-core",
+ "plurifold-runtime",
+ "serde",
+]
+
+[[package]]
+name = "plurifold-runtime"
+version = "0.2.0"
+dependencies = [
+ "plurifold-core",
+ "plurifold-scheduler",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "plurifold-scheduler"
+version = "0.2.0"
+dependencies = [
+ "plurifold-core",
+ "thiserror",
+]
+
+[[package]]
+name = "plurifold-store"
+version = "0.2.0"
+dependencies = [
+ "hex",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "potential_utf"

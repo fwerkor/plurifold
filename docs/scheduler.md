@@ -2,7 +2,7 @@
 
 ## Objective
 
-For task `t` on resource `r`, Mosaic estimates:
+For task `t` on resource `r`, Plurifold estimates:
 
 `C(t,r) = Ccompute + Cinput + Cqueue + Cstartup + Crisk + Cpolicy`
 
@@ -42,7 +42,7 @@ Hard compatibility should never be represented only as a large score.
 
 ## Adaptive graph granularity
 
-Placement alone is insufficient on WANs. Mosaic therefore treats graph rewriting as a first-class future mechanism.
+Placement alone is insufficient on WANs. Plurifold therefore treats graph rewriting as a first-class future mechanism.
 
 For producer `A` and consumer `B`, if their intermediate object is large relative to the compute between WAN crossings, it may be better to fuse them into one placement unit. Conversely, compute-heavy independent work may be split and replicated.
 

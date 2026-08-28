@@ -1,6 +1,6 @@
 # Contributing
 
-Mosaic is currently a research prototype. Keep the control model explicit and small: avoid abstractions that silently assume low latency, fixed cluster membership, or replay-safe side effects.
+Plurifold is currently a research prototype. Keep the control model explicit and small: avoid abstractions that silently assume low latency, fixed cluster membership, or replay-safe side effects.
 
 Before submitting changes:
 

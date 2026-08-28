@@ -2,7 +2,7 @@
 
 ## 1. Problem statement
 
-Mosaic targets a compute pool in which resources may have different ISAs, accelerator vendors, memory capacities, software stacks, performance, trust/reliability characteristics, and network distance. The pool is elastic: a machine can appear or disappear without forming or rebuilding a global process group.
+Plurifold targets a compute pool in which resources may have different ISAs, accelerator vendors, memory capacities, software stacks, performance, trust/reliability characteristics, and network distance. The pool is elastic: a machine can appear or disappear without forming or rebuilding a global process group.
 
 The system is not a distributed shared-memory machine and not a WAN collective library. It is a **logical compute fabric** that maps coarse computations and data to physical resources while preserving topology as an execution concern.
 
@@ -55,7 +55,7 @@ Task execution also uses leases. A coordinator may reschedule expired work if an
 
 ### Executors
 
-Mosaic does not force hardware through one low-level instruction set. Executors are backend-native. A task artifact may eventually be:
+Plurifold does not force hardware through one low-level instruction set. Executors are backend-native. A task artifact may eventually be:
 
 - a WASI Component for portable CPU work;
 - an OCI/native artifact;
@@ -104,7 +104,7 @@ A collective or tightly coupled subgraph can declare co-location constraints. Th
 
 A completed object is immutable. New state creates a new logical version. This makes caching, replication, deduplication, and lineage reasoning simpler.
 
-## 6. What Mosaic intentionally does not promise
+## 6. What Plurifold intentionally does not promise
 
 - transparent POSIX shared memory across WAN;
 - arbitrary migration of an instruction-level process at any instant;

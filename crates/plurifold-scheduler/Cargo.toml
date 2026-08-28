@@ -1,0 +1,11 @@
+[package]
+name = "plurifold-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+plurifold-core = { path = "../plurifold-core" }
+thiserror.workspace = true

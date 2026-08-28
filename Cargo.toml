@@ -1,13 +1,13 @@
 [workspace]
 members = [
-    "crates/mosaic-core",
-    "crates/mosaic-protocol",
-    "crates/mosaic-store",
-    "crates/mosaic-scheduler",
-    "crates/mosaic-runtime",
-    "crates/mosaic-coordinator",
-    "crates/mosaic-agent",
-    "crates/mosaic-cli",
+    "crates/plurifold-core",
+    "crates/plurifold-protocol",
+    "crates/plurifold-store",
+    "crates/plurifold-scheduler",
+    "crates/plurifold-runtime",
+    "crates/plurifold-coordinator",
+    "crates/plurifold-agent",
+    "crates/plurifold-cli",
 ]
 resolver = "2"
 
@@ -15,7 +15,7 @@ resolver = "2"
 version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/fwerkor/mosaic-fabric"
+repository = "https://github.com/fwerkor/plurifold"
 rust-version = "1.80"
 
 [workspace.dependencies]

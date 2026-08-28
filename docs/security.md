@@ -1,6 +1,6 @@
 # Security and trust model
 
-Mosaic's target environment can cross administrative and network boundaries, so security cannot be treated as an RPC implementation detail. The v0 code does not yet enforce these mechanisms, but the architecture reserves the following boundaries.
+Plurifold's target environment can cross administrative and network boundaries, so security cannot be treated as an RPC implementation detail. The v0 code does not yet enforce these mechanisms, but the architecture reserves the following boundaries.
 
 ## Identities and authenticated membership
 
@@ -24,7 +24,7 @@ Resource requirements should eventually include a trust domain/attestation polic
 
 ## Malicious resources
 
-Lease and digest checks protect against stale or corrupted results but do not prove that a malicious worker performed a computation correctly. Workloads requiring Byzantine resistance need domain-specific verification, replication/voting, trusted execution, or proofs. Mosaic does not claim generic Byzantine-safe computation.
+Lease and digest checks protect against stale or corrupted results but do not prove that a malicious worker performed a computation correctly. Workloads requiring Byzantine resistance need domain-specific verification, replication/voting, trusted execution, or proofs. Plurifold does not claim generic Byzantine-safe computation.
 
 ## Coordinator authority
 

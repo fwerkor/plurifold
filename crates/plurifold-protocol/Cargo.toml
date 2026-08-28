@@ -1,0 +1,12 @@
+[package]
+name = "plurifold-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+plurifold-core = { path = "../plurifold-core" }
+plurifold-runtime = { path = "../plurifold-runtime" }
+serde.workspace = true

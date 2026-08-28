@@ -1,6 +1,6 @@
 # Protocol
 
-Mosaic v0.2 uses a deliberately small **HTTP/JSON control plane**. The Rust request/response types in `mosaic-protocol` are authoritative for the current prototype. `proto/mosaic.proto` remains a transport-neutral design sketch for a possible future binary RPC encoding; it is not generated into the build.
+Plurifold v0.2 uses a deliberately small **HTTP/JSON control plane**. The Rust request/response types in `plurifold-protocol` are authoritative for the current prototype. `proto/plurifold.proto` remains a transport-neutral design sketch for a possible future binary RPC encoding; it is not generated into the build.
 
 ## Membership
 
