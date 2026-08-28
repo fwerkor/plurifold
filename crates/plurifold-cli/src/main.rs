@@ -4,16 +4,17 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use plurifold_core::{
-    Architecture, CooperativeJobSpec, CostHint, EffectSemantics, JobId, LinkProfile, ObjectId,
-    ObjectMetadata, ResourceDescriptor, ResourceId, ResourceRequirements, TaskId, TaskSpec,
-    TopologySnapshot,
+    Architecture, CooperativeJobSpec, CostHint, EffectSemantics, JobId, LinkProfile,
+    LogicalJobSpec, ObjectId, ObjectMetadata, ResourceDescriptor, ResourceId, ResourceRequirements,
+    TaskId, TaskSpec, TopologySnapshot,
 };
 use plurifold_protocol::{
-    CooperativeJobView, ErrorResponse, LinkUpdateRequest, PublishObjectRequest, PutObjectResponse,
-    ResourceListResponse, SubmitCooperativeJobRequest, SubmitCooperativeJobResponse,
-    SubmitTaskRequest, SubmitTaskResponse, TaskView,
+    CooperativeJobView, ErrorResponse, LinkUpdateRequest, PlanLogicalJobRequest,
+    PublishObjectRequest, PutObjectResponse, ResourceListResponse, SubmitCooperativeJobRequest,
+    SubmitCooperativeJobResponse, SubmitPlannedJobResponse, SubmitTaskRequest, SubmitTaskResponse,
+    TaskView,
 };
-use plurifold_runtime::{CooperativeJobStatus, Fabric, TaskStatus};
+use plurifold_runtime::{CooperativeJobStatus, CooperativePlan, Fabric, TaskStatus};
 use reqwest::Client;
 
 #[derive(Parser)]
@@ -105,6 +106,20 @@ enum JobCommand {
         #[arg(long)]
         file: PathBuf,
     },
+    /// Preview implementation choices and predicted placements for a logical job.
+    Plan {
+        #[arg(long)]
+        coordinator: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Plan a logical job against current resources and submit the generated cooperative job.
+    AutoSubmit {
+        #[arg(long)]
+        coordinator: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
     /// Query a cooperative job and all role states.
     Status {
         #[arg(long)]
@@ -178,6 +193,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let bytes = tokio::fs::read(file).await?;
                 let job: CooperativeJobSpec = serde_json::from_slice(&bytes)?;
                 submit_job(&Client::new(), &coordinator, job).await?;
+            }
+            JobCommand::Plan { coordinator, file } => {
+                let bytes = tokio::fs::read(file).await?;
+                let job: LogicalJobSpec = serde_json::from_slice(&bytes)?;
+                let plan = plan_job(&Client::new(), &coordinator, job).await?;
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            }
+            JobCommand::AutoSubmit { coordinator, file } => {
+                let bytes = tokio::fs::read(file).await?;
+                let job: LogicalJobSpec = serde_json::from_slice(&bytes)?;
+                let submitted = auto_submit_job(&Client::new(), &coordinator, job).await?;
+                println!("{}", submitted.job_id);
             }
             JobCommand::Status { coordinator, job } => {
                 let view = cooperative_job_view(&Client::new(), &coordinator, job).await?;
@@ -306,6 +333,38 @@ async fn submit_job(
     let submitted: SubmitCooperativeJobResponse = response.json().await?;
     println!("{}", submitted.job_id);
     Ok(())
+}
+
+async fn plan_job(
+    client: &Client,
+    coordinator: &str,
+    job: LogicalJobSpec,
+) -> Result<CooperativePlan, Box<dyn std::error::Error>> {
+    let response = checked(
+        client
+            .post(format!("{}/v1/jobs/plan", base(coordinator)))
+            .json(&PlanLogicalJobRequest { job })
+            .send()
+            .await?,
+    )
+    .await?;
+    Ok(response.json().await?)
+}
+
+async fn auto_submit_job(
+    client: &Client,
+    coordinator: &str,
+    job: LogicalJobSpec,
+) -> Result<SubmitPlannedJobResponse, Box<dyn std::error::Error>> {
+    let response = checked(
+        client
+            .post(format!("{}/v1/jobs/auto", base(coordinator)))
+            .json(&PlanLogicalJobRequest { job })
+            .send()
+            .await?,
+    )
+    .await?;
+    Ok(response.json().await?)
 }
 
 async fn cooperative_job_view(

@@ -223,6 +223,30 @@ pub struct CooperativeJobSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoleImplementation {
+    pub name: String,
+    pub task: TaskTemplate,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LogicalRoleSpec {
+    pub name: String,
+    pub implementations: Vec<RoleImplementation>,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
+
+/// A higher-level cooperative computation whose role boundaries are declared by the application or
+/// a domain library while Plurifold chooses concrete implementations and predicts placements.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LogicalJobSpec {
+    #[serde(default)]
+    pub id: JobId,
+    pub roles: Vec<LogicalRoleSpec>,
+    pub outputs: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ObjectMetadata {
     pub id: ObjectId,
     pub size_bytes: u64,

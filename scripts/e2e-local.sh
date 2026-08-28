@@ -57,6 +57,17 @@ if isinstance(status, dict) and "Running" in status:
 '
 }
 
+json_role_task() {
+  local name=$1
+  python3 -c 'import json,sys
+name=sys.argv[1]
+for role in json.load(sys.stdin)["roles"]:
+    status=role["status"]
+    if role["name"] == name and isinstance(status, dict) and "Submitted" in status:
+        print(status["Submitted"])
+        break' "$name"
+}
+
 cargo build --workspace --quiet
 
 ./target/debug/plurifold-coordinator \
@@ -202,18 +213,8 @@ LEFT_TASK=""
 RIGHT_TASK=""
 for _ in $(seq 1 100); do
   JOB_VIEW=$(./target/debug/plurifold job status --coordinator "$COORD" --job "$COOPERATIVE_JOB")
-  LEFT_TASK=$(printf '%s' "$JOB_VIEW" | python3 -c 'import json,sys
-name=sys.argv[1]
-for role in json.load(sys.stdin)["roles"]:
-    if role["name"] == name and isinstance(role["status"], dict) and "Submitted" in role["status"]:
-        print(role["status"]["Submitted"])
-        break' left)
-  RIGHT_TASK=$(printf '%s' "$JOB_VIEW" | python3 -c 'import json,sys
-name=sys.argv[1]
-for role in json.load(sys.stdin)["roles"]:
-    if role["name"] == name and isinstance(role["status"], dict) and "Submitted" in role["status"]:
-        print(role["status"]["Submitted"])
-        break' right)
+  LEFT_TASK=$(printf '%s' "$JOB_VIEW" | json_role_task left)
+  RIGHT_TASK=$(printf '%s' "$JOB_VIEW" | json_role_task right)
   if [[ -n "$LEFT_TASK" && -n "$RIGHT_TASK" ]]; then
     break
   fi
@@ -244,6 +245,179 @@ done
 COOPERATIVE_EXPECTED=$(printf 'donedone' | sha256sum | awk '{print $1}')
 [[ -f "$TMP/a/sha256/$COOPERATIVE_EXPECTED" ]]
 echo "cooperative-job: ok (left=$LEFT_RESOURCE, right=$RIGHT_RESOURCE, joined on worker-a)"
+
+printf 'auto-left|' >"$TMP/auto-left"
+printf 'auto-right\n' >"$TMP/auto-right"
+AUTO_LEFT_OBJ=$(./target/debug/plurifold put --coordinator "$COORD" --agent "$A_URL" --file "$TMP/auto-left")
+AUTO_RIGHT_OBJ=$(./target/debug/plurifold put --coordinator "$COORD" --agent "$B_URL" --file "$TMP/auto-right")
+
+cat >"$TMP/logical-job.json" <<JSON
+{
+  "roles": [
+    {
+      "name": "left",
+      "implementations": [
+        {
+          "name": "left-native",
+          "task": {
+            "artifact": "builtin:sleep",
+            "entrypoint": "run",
+            "arguments": ["1500"],
+            "inputs": ["$AUTO_LEFT_OBJ"],
+            "requirements": {
+              "architecture": null,
+              "min_memory_bytes": 0,
+              "accelerator": null,
+              "required_features": ["demo:role-left"]
+            },
+            "effects": "Pure",
+            "cost": {"compute_ms_on_reference": 2000.0, "output_bytes": 104857600}
+          }
+        },
+        {
+          "name": "left-fallback",
+          "task": {
+            "artifact": "builtin:sleep",
+            "entrypoint": "run",
+            "arguments": ["1500"],
+            "inputs": ["$AUTO_LEFT_OBJ"],
+            "requirements": {
+              "architecture": null,
+              "min_memory_bytes": 0,
+              "accelerator": null,
+              "required_features": ["demo:role-right"]
+            },
+            "effects": "Pure",
+            "cost": {"compute_ms_on_reference": 12000.0, "output_bytes": 104857600}
+          }
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "name": "right",
+      "implementations": [
+        {
+          "name": "right-native",
+          "task": {
+            "artifact": "builtin:sleep",
+            "entrypoint": "run",
+            "arguments": ["1500"],
+            "inputs": ["$AUTO_RIGHT_OBJ"],
+            "requirements": {
+              "architecture": null,
+              "min_memory_bytes": 0,
+              "accelerator": null,
+              "required_features": ["demo:role-right"]
+            },
+            "effects": "Pure",
+            "cost": {"compute_ms_on_reference": 2000.0, "output_bytes": 1048576}
+          }
+        },
+        {
+          "name": "right-fallback",
+          "task": {
+            "artifact": "builtin:sleep",
+            "entrypoint": "run",
+            "arguments": ["1500"],
+            "inputs": ["$AUTO_RIGHT_OBJ"],
+            "requirements": {
+              "architecture": null,
+              "min_memory_bytes": 0,
+              "accelerator": null,
+              "required_features": ["demo:role-left"]
+            },
+            "effects": "Pure",
+            "cost": {"compute_ms_on_reference": 12000.0, "output_bytes": 1048576}
+          }
+        }
+      ],
+      "depends_on": []
+    },
+    {
+      "name": "join",
+      "implementations": [
+        {
+          "name": "join-left",
+          "task": {
+            "artifact": "builtin:concat",
+            "entrypoint": "run",
+            "requirements": {
+              "architecture": null,
+              "min_memory_bytes": 0,
+              "accelerator": null,
+              "required_features": ["demo:role-left"]
+            },
+            "effects": "Pure",
+            "cost": {"compute_ms_on_reference": 100.0, "output_bytes": 21}
+          }
+        },
+        {
+          "name": "join-right",
+          "task": {
+            "artifact": "builtin:concat",
+            "entrypoint": "run",
+            "requirements": {
+              "architecture": null,
+              "min_memory_bytes": 0,
+              "accelerator": null,
+              "required_features": ["demo:role-right"]
+            },
+            "effects": "Pure",
+            "cost": {"compute_ms_on_reference": 100.0, "output_bytes": 21}
+          }
+        }
+      ],
+      "depends_on": ["left", "right"]
+    }
+  ],
+  "outputs": ["join"]
+}
+JSON
+
+AUTO_PLAN=$(./target/debug/plurifold job plan --coordinator "$COORD" --file "$TMP/logical-job.json")
+printf '%s' "$AUTO_PLAN" | python3 -c 'import json,sys
+data=json.load(sys.stdin)
+expected={"left":("left-native",sys.argv[1]),"right":("right-native",sys.argv[2]),"join":("join-left",sys.argv[1])}
+seen={role["name"]:(role["implementation"],role["placement"]["resource_id"]) for role in data["roles"]}
+assert seen == expected, (seen, expected)
+join=next(role for role in data["roles"] if role["name"] == "join")
+assert join["placement"]["input_transfer_ms"] > 0
+' "$A_ID" "$B_ID"
+
+AUTO_JOB=$(./target/debug/plurifold job auto-submit --coordinator "$COORD" --file "$TMP/logical-job.json")
+AUTO_LEFT_TASK=""
+AUTO_RIGHT_TASK=""
+for _ in $(seq 1 100); do
+  AUTO_VIEW=$(./target/debug/plurifold job status --coordinator "$COORD" --job "$AUTO_JOB")
+  AUTO_LEFT_TASK=$(printf '%s' "$AUTO_VIEW" | json_role_task left)
+  AUTO_RIGHT_TASK=$(printf '%s' "$AUTO_VIEW" | json_role_task right)
+  if [[ -n "$AUTO_LEFT_TASK" && -n "$AUTO_RIGHT_TASK" ]]; then
+    break
+  fi
+  sleep 0.05
+done
+[[ -n "$AUTO_LEFT_TASK" && -n "$AUTO_RIGHT_TASK" ]]
+
+AUTO_LEFT_RESOURCE=""
+AUTO_RIGHT_RESOURCE=""
+for _ in $(seq 1 100); do
+  AUTO_LEFT_VIEW=$(./target/debug/plurifold status --coordinator "$COORD" --task "$AUTO_LEFT_TASK")
+  AUTO_RIGHT_VIEW=$(./target/debug/plurifold status --coordinator "$COORD" --task "$AUTO_RIGHT_TASK")
+  AUTO_LEFT_RESOURCE=$(printf '%s' "$AUTO_LEFT_VIEW" | json_running_resource)
+  AUTO_RIGHT_RESOURCE=$(printf '%s' "$AUTO_RIGHT_VIEW" | json_running_resource)
+  if [[ -n "$AUTO_LEFT_RESOURCE" && -n "$AUTO_RIGHT_RESOURCE" ]]; then
+    break
+  fi
+  sleep 0.05
+done
+[[ "$AUTO_LEFT_RESOURCE" == "$A_ID" ]]
+[[ "$AUTO_RIGHT_RESOURCE" == "$B_ID" ]]
+
+./target/debug/plurifold job wait --coordinator "$COORD" --job "$AUTO_JOB" --timeout-s 10 >/dev/null
+AUTO_EXPECTED=$(printf 'auto-left|auto-right\n' | sha256sum | awk '{print $1}')
+[[ -f "$TMP/a/sha256/$AUTO_EXPECTED" ]]
+echo "auto-planner: ok (left-native->$AUTO_LEFT_RESOURCE, right-native->$AUTO_RIGHT_RESOURCE, join-left predicted on worker-a)"
 
 FAILURE_TASK=$(./target/debug/plurifold submit \
   --coordinator "$COORD" \

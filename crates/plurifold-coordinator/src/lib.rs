@@ -11,13 +11,14 @@ use axum::{Json, Router};
 use plurifold_core::{JobId, ObjectId, ResourceId, TaskId};
 use plurifold_protocol::{
     CompleteExecutionRequest, CooperativeJobView, ErrorResponse, HeartbeatRequest,
-    LinkUpdateRequest, ObjectReplica, PublishObjectRequest, RegisterReplicaRequest,
-    RegisterResourceRequest, RegisterResourceResponse, RenewExecutionRequest, ResolvedObject,
-    ResourceListResponse, ResourceView, SubmitCooperativeJobRequest, SubmitCooperativeJobResponse,
+    LinkUpdateRequest, ObjectReplica, PlanLogicalJobRequest, PublishObjectRequest,
+    RegisterReplicaRequest, RegisterResourceRequest, RegisterResourceResponse,
+    RenewExecutionRequest, ResolvedObject, ResourceListResponse, ResourceView,
+    SubmitCooperativeJobRequest, SubmitCooperativeJobResponse, SubmitPlannedJobResponse,
     SubmitTaskRequest, SubmitTaskResponse, TaskView, WorkAssignment, WorkPollRequest,
     WorkPollResponse,
 };
-use plurifold_runtime::{Fabric, FabricError};
+use plurifold_runtime::{CooperativePlan, Fabric, FabricError, PlanError};
 use tokio::sync::Mutex;
 
 #[derive(Clone)]
@@ -54,6 +55,8 @@ impl Coordinator {
             .route("/v1/tasks", post(submit_task))
             .route("/v1/tasks/{task_id}", get(get_task))
             .route("/v1/jobs", post(submit_cooperative_job))
+            .route("/v1/jobs/plan", post(plan_logical_job))
+            .route("/v1/jobs/auto", post(submit_planned_job))
             .route("/v1/jobs/{job_id}", get(get_cooperative_job))
             .route("/v1/topology/link", post(update_link))
             .with_state(self)
@@ -295,6 +298,34 @@ async fn submit_cooperative_job(
     Ok(Json(SubmitCooperativeJobResponse { job_id }))
 }
 
+async fn plan_logical_job(
+    State(coordinator): State<Coordinator>,
+    Json(request): Json<PlanLogicalJobRequest>,
+) -> Result<Json<CooperativePlan>, ApiError> {
+    let state = coordinator.inner.lock().await;
+    let plan = state
+        .fabric
+        .plan_logical_job(&request.job)
+        .map_err(ApiError::from_plan)?;
+    Ok(Json(plan))
+}
+
+async fn submit_planned_job(
+    State(coordinator): State<Coordinator>,
+    Json(request): Json<PlanLogicalJobRequest>,
+) -> Result<Json<SubmitPlannedJobResponse>, ApiError> {
+    let mut state = coordinator.inner.lock().await;
+    let plan = state
+        .fabric
+        .plan_logical_job(&request.job)
+        .map_err(ApiError::from_plan)?;
+    let job_id = state
+        .fabric
+        .submit_cooperative(plan.job.clone())
+        .map_err(ApiError::from_fabric)?;
+    Ok(Json(SubmitPlannedJobResponse { job_id, plan }))
+}
+
 async fn get_cooperative_job(
     State(coordinator): State<Coordinator>,
     Path(job_id): Path<String>,
@@ -393,6 +424,17 @@ impl ApiError {
             | FabricError::StaleResourceEpoch(_) => StatusCode::CONFLICT,
             FabricError::InvalidCooperativeJob(_) => StatusCode::BAD_REQUEST,
             FabricError::Scheduling(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        };
+        Self {
+            status,
+            message: error.to_string(),
+        }
+    }
+
+    fn from_plan(error: PlanError) -> Self {
+        let status = match error {
+            PlanError::InvalidLogicalJob(_) => StatusCode::BAD_REQUEST,
+            PlanError::NoFeasibleImplementation(_) => StatusCode::UNPROCESSABLE_ENTITY,
         };
         Self {
             status,

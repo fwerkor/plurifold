@@ -37,8 +37,12 @@
 - [x] predecessor output Objects wired into dependent roles
 - [x] logical job output aggregation and uncertainty propagation
 - [x] multi-process E2E with two simultaneous role executions and a cross-resource join
+- [x] logical role graphs with multiple implementation alternatives
+- [x] automatic implementation/resource planning from current capabilities, locality, and topology
+- [x] predicted intermediate-transfer cost and resource-availability-aware makespan planning
+- [x] plan preview and plan-and-submit control-plane/CLI paths
 - [ ] dynamic role insertion while a job is running
-- [ ] automatic decomposition/planning from higher-level computation graphs
+- [ ] automatic role-boundary inference/decomposition from higher-level computation graphs or source programs
 - [ ] elastic role replication and quorum/reduction policies
 
 ## Phase 3 — Topology and graph adaptation

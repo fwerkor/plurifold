@@ -2,12 +2,16 @@ use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use plurifold_core::{
-    CooperativeJobSpec, ExecutionId, ExecutionLease, JobId, MembershipLease, ObjectId,
-    ObjectMetadata, ResourceDescriptor, ResourceId, TaskId, TaskSpec, TopologySnapshot,
+    CooperativeJobSpec, ExecutionId, ExecutionLease, JobId, LogicalJobSpec, MembershipLease,
+    ObjectId, ObjectMetadata, ResourceDescriptor, ResourceId, TaskId, TaskSpec, TopologySnapshot,
 };
 use plurifold_scheduler::{PlacementDecision, ScheduleError, TopologyAwareScheduler};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+mod planner;
+
+pub use planner::{CooperativePlan, PlanError, PlannedPlacement, PlannedRole};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum TaskStatus {
@@ -324,6 +328,16 @@ impl Fabric {
         )
     }
 
+    pub fn plan_logical_job(&self, spec: &LogicalJobSpec) -> Result<CooperativePlan, PlanError> {
+        planner::plan(
+            spec,
+            &self.scheduler,
+            &self.schedulable_resources(),
+            &self.objects,
+            &self.topology,
+        )
+    }
+
     pub fn task_status(&self, task_id: TaskId) -> Option<&TaskStatus> {
         self.tasks.get(&task_id).map(|record| &record.status)
     }
@@ -364,26 +378,7 @@ impl Fabric {
         if record.status != TaskStatus::Pending {
             return Err(FabricError::TaskNotPending(task_id));
         }
-        let now = now_unix_ms();
-        let busy_resources: HashSet<_> = self
-            .tasks
-            .values()
-            .filter_map(|task| match &task.status {
-                TaskStatus::Running(lease) if lease.expires_at_unix_ms > now => {
-                    Some(lease.resource_id)
-                }
-                _ => None,
-            })
-            .collect();
-        let active: Vec<_> = self
-            .resources
-            .values()
-            .filter(|resource| {
-                resource.expires_at_unix_ms > now
-                    && !busy_resources.contains(&resource.descriptor.id)
-            })
-            .map(|resource| resource.descriptor.clone())
-            .collect();
+        let active = self.schedulable_resources();
         Ok(self
             .scheduler
             .choose(&record.spec, &active, &self.objects, &self.topology)?)
@@ -610,6 +605,28 @@ impl Fabric {
             .filter(|resource| resource.expires_at_unix_ms > now)
             .count()
     }
+
+    fn schedulable_resources(&self) -> Vec<ResourceDescriptor> {
+        let now = now_unix_ms();
+        let busy_resources: HashSet<_> = self
+            .tasks
+            .values()
+            .filter_map(|task| match &task.status {
+                TaskStatus::Running(lease) if lease.expires_at_unix_ms > now => {
+                    Some(lease.resource_id)
+                }
+                _ => None,
+            })
+            .collect();
+        self.resources
+            .values()
+            .filter(|resource| {
+                resource.expires_at_unix_ms > now
+                    && !busy_resources.contains(&resource.descriptor.id)
+            })
+            .map(|resource| resource.descriptor.clone())
+            .collect()
+    }
 }
 
 fn same_object_identity(left: &ObjectMetadata, right: &ObjectMetadata) -> bool {
@@ -621,87 +638,13 @@ fn same_object_identity(left: &ObjectMetadata, right: &ObjectMetadata) -> bool {
 }
 
 fn validate_cooperative_job(job: &CooperativeJobSpec) -> Result<(), FabricError> {
-    if job.roles.is_empty() {
-        return Err(FabricError::InvalidCooperativeJob(
-            "at least one role is required".into(),
-        ));
-    }
-    if job.outputs.is_empty() {
-        return Err(FabricError::InvalidCooperativeJob(
-            "at least one output role is required".into(),
-        ));
-    }
-
-    let mut names = HashSet::with_capacity(job.roles.len());
-    for role in &job.roles {
-        if role.name.trim().is_empty() {
-            return Err(FabricError::InvalidCooperativeJob(
-                "role names cannot be empty".into(),
-            ));
-        }
-        if !names.insert(role.name.as_str()) {
-            return Err(FabricError::InvalidCooperativeJob(format!(
-                "duplicate role {}",
-                role.name
-            )));
-        }
-    }
-
-    for role in &job.roles {
-        let mut dependencies = HashSet::with_capacity(role.depends_on.len());
-        for dependency in &role.depends_on {
-            if !names.contains(dependency.as_str()) {
-                return Err(FabricError::InvalidCooperativeJob(format!(
-                    "role {} depends on unknown role {dependency}",
-                    role.name
-                )));
-            }
-            if !dependencies.insert(dependency.as_str()) {
-                return Err(FabricError::InvalidCooperativeJob(format!(
-                    "role {} lists dependency {dependency} more than once",
-                    role.name
-                )));
-            }
-        }
-    }
-    let mut outputs = HashSet::with_capacity(job.outputs.len());
-    for output in &job.outputs {
-        if !names.contains(output.as_str()) {
-            return Err(FabricError::InvalidCooperativeJob(format!(
-                "unknown output role {output}"
-            )));
-        }
-        if !outputs.insert(output.as_str()) {
-            return Err(FabricError::InvalidCooperativeJob(format!(
-                "output role {output} is listed more than once"
-            )));
-        }
-    }
-
-    let mut resolved = HashSet::with_capacity(job.roles.len());
-    loop {
-        let before = resolved.len();
-        for role in &job.roles {
-            if resolved.contains(role.name.as_str()) {
-                continue;
-            }
-            if role
-                .depends_on
-                .iter()
-                .all(|dependency| resolved.contains(dependency.as_str()))
-            {
-                resolved.insert(role.name.as_str());
-            }
-        }
-        if resolved.len() == job.roles.len() {
-            return Ok(());
-        }
-        if resolved.len() == before {
-            return Err(FabricError::InvalidCooperativeJob(
-                "role dependency graph contains a cycle".into(),
-            ));
-        }
-    }
+    planner::validate_role_graph(
+        job.roles
+            .iter()
+            .map(|role| (role.name.as_str(), role.depends_on.as_slice())),
+        &job.outputs,
+    )
+    .map_err(FabricError::InvalidCooperativeJob)
 }
 
 fn now_unix_ms() -> u64 {

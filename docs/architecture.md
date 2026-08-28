@@ -27,6 +27,14 @@ Cooperative Job
    └─ role C depends on A,B -> Task -> result Object(s)
 ```
 
+### Logical planner
+
+A `LogicalJobSpec` keeps the role/dependency graph explicit but allows each role to advertise multiple Task implementations. The planner compiles that logical graph into one concrete `CooperativeJobSpec` using a snapshot of currently schedulable resources, object locations, and topology.
+
+For each ready role it scores implementation/resource pairs with the ordinary topology-aware scheduler. Predicted predecessor outputs are represented as temporary planning objects located at the chosen predecessor resources, with size derived from the selected implementation's output-size hint. This lets a downstream choice account for the communication cost created by upstream choices instead of selecting every role independently.
+
+The planner also tracks predicted resource availability so independent roles can be spread across idle resources rather than accidentally serialized on one worker. Its placement output is advisory: execution-time scheduling remains authoritative and may choose another compatible resource if membership or locality changes after planning.
+
 ### Graph runtime
 
 The runtime tracks dependencies and may perform semantics-preserving transformations:

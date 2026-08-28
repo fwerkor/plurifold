@@ -28,7 +28,11 @@ simulate (GPU) ───┘
 
 The job is the logical unit seen by the application, while each Task retains its own execution lease, retry semantics, placement decision, and output objects. If an `Exclusive` role loses an ambiguous execution attempt, the containing job becomes `Uncertain`. Pure or idempotent role tasks keep the existing replay behavior.
 
-The v0.3 implementation uses an explicit static role graph. It does not yet infer role decomposition from arbitrary code or split one instruction-level computation across unrelated devices. Future graph planning can generate the same role/task representation without changing the execution protocol.
+The v0.4 implementation adds a `LogicalJobSpec` one level above `CooperativeJobSpec`. A logical role keeps the same semantic dependency boundary but may offer multiple named Task implementations, for example CPU, CUDA, or CANN variants. The planner evaluates the currently schedulable resources and chooses one implementation per role using the same placement cost model used by ordinary Tasks. For downstream roles it also predicts predecessor output locations and uses each implementation's `output_bytes` hint to estimate intermediate transfer cost.
+
+The resulting `CooperativePlan` contains the compiled `CooperativeJobSpec`, selected implementation names, predicted resources, cost breakdowns, and an estimated makespan. Predicted resources explain the snapshot plan; they are not hard bindings. When the compiled job executes, each role still goes through normal lease-time scheduling so current membership and data locality remain authoritative.
+
+Role decomposition itself is still explicit. Plurifold does not infer arbitrary program boundaries from source code or split one instruction-level computation across unrelated devices. Domain libraries or future graph compilers can generate `LogicalJobSpec` while preserving the same execution protocol.
 
 ## Object
 

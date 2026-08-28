@@ -31,6 +31,9 @@ Applications / libraries
         |
 Programming model: Cooperative Job / Task / Object / Actor / Stream / Collective
         |
+Logical planner
+  role implementations | predicted placement | intermediate transfer
+        |
 Dynamic graph runtime
   dependencies | retry | fusion | batching | checkpoint
         |
@@ -47,7 +50,7 @@ Resource fabric
 
 ## Repository status
 
-The repository now contains a **v0.3 networked research prototype**, not only a design scaffold:
+The repository now contains a **v0.4 networked research prototype**, not only a design scaffold:
 
 - typed Resource, Task, Object, Topology, membership-lease, and execution-lease models;
 - a topology-aware placement cost model;
@@ -55,12 +58,13 @@ The repository now contains a **v0.3 networked research prototype**, not only a 
 - hot-pluggable agents with membership heartbeats and epoch-based reincarnation safety;
 - renewable work leases for long-running tasks;
 - cooperative jobs whose independent roles can execute concurrently on different resources and whose dependent roles consume predecessor outputs;
+- a logical-job planner that chooses among per-role implementations using current resource capabilities, compute cost, input locality, predicted intermediate transfers, and topology;
 - a SHA-256 content-addressed local object cache;
 - direct agent-to-agent HTTP object transfer with digest verification and replica registration;
 - replay-safe retry after worker loss, with non-replay-safe tasks entering `Uncertain`;
 - a small builtin executor (`identity`, `concat`, `echo`, `sleep`) used to exercise the runtime without hiding unimplemented portability behind a fake generic executor;
-- a CLI for object publication, task and cooperative-job submission/status, resource inspection, and topology links;
-- a multi-process E2E test that verifies direct peer transfer, two-resource cooperative execution with a join role, and takeover after worker loss.
+- a CLI for object publication, task/cooperative-job submission, planner preview/auto-submit, resource inspection, and topology links;
+- a multi-process E2E test that verifies direct peer transfer, explicit and automatically planned two-resource cooperative execution, cross-resource joins, and takeover after worker loss.
 
 Still intentionally missing: authentication/TLS, durable coordinator state, active RTT/bandwidth probing, native/WASI sandboxed executors, accelerator adapters, graph rewriting, and production-grade observability.
 
@@ -101,6 +105,20 @@ cargo run -p plurifold-cli -- job submit \
 ```
 
 Roles without dependencies become schedulable together. A dependent role is materialized only after all predecessors finish, and their output Object IDs are appended to its inputs.
+
+For automatic implementation/placement planning, submit a logical role graph whose roles contain alternative Task templates:
+
+```bash
+cargo run -p plurifold-cli -- job plan \
+  --coordinator http://127.0.0.1:8080 \
+  --file examples/logical-job.json
+
+cargo run -p plurifold-cli -- job auto-submit \
+  --coordinator http://127.0.0.1:8080 \
+  --file examples/logical-job.json
+```
+
+Planning is a snapshot compilation step. Role boundaries are still declared by the application or a domain library; v0.4 does **not** infer arbitrary program decomposition. Predicted resources explain the plan but are not hard bindings: the normal scheduler rechecks placement when each execution lease is issued.
 
 ## Design invariants
 
