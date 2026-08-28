@@ -1,6 +1,6 @@
 # Protocol
 
-Plurifold v0.4 uses a deliberately small **HTTP/JSON control plane**. The Rust request/response types in `plurifold-protocol` are authoritative for the current prototype. `proto/plurifold.proto` remains a transport-neutral design sketch for a possible future binary RPC encoding; it is not generated into the build.
+Plurifold v0.5 uses a deliberately small **HTTP/JSON control plane** (protocol constant `API_VERSION = 2`). The Rust request/response types in `plurifold-protocol` are authoritative for the current prototype. `proto/plurifold.proto` remains a transport-neutral design sketch for a possible future binary RPC encoding; it is not generated into the build.
 
 ## Membership
 
@@ -32,19 +32,19 @@ If a lease expires, replay-safe work returns to `Pending`. An `Exclusive` task i
 
 `POST /v1/jobs` submits a `CooperativeJobSpec`. Root roles are immediately materialized as ordinary Tasks. When a role completes, the coordinator records its output Object IDs and materializes any roles whose dependencies are now satisfied. Those downstream Tasks use predecessor outputs as normal object inputs, so cross-resource edges reuse the same replica discovery and direct peer-transfer path as standalone Tasks.
 
-`GET /v1/jobs/{id}` returns the logical job status plus each role's state. A job completes after all roles complete; its result is the concatenated output Object IDs of the roles named in `job.outputs`. An unreplayable role entering `Uncertain` propagates that state to the whole job.
+`GET /v1/jobs/{id}` returns either the fixed `CooperativeJobSpec` or live `LogicalJobSpec`, plus each role's state. Dynamically selected roles also report the chosen implementation, advisory resource, and ready-time estimated cost. A job completes after all roles complete; its result is the concatenated output Object IDs of the roles named in the job definition. An unreplayable role entering `Uncertain` propagates that state to the whole job.
 
 ## Logical planning
 
 `POST /v1/jobs/plan` accepts a `LogicalJobSpec` whose roles contain alternative Task implementations. It returns a `CooperativePlan` with one selected implementation per role, predicted resource placements, placement-cost breakdowns, an estimated makespan, and the compiled `CooperativeJobSpec`.
 
-`POST /v1/jobs/auto` performs the same planning step and immediately submits the compiled cooperative job while the coordinator state lock still protects that snapshot from concurrent control-plane changes. The plan is still not a placement reservation: agents use the ordinary Task polling and lease path, so execution-time scheduling rechecks current resource availability and object locality.
+`POST /v1/jobs/auto` accepts the same `LogicalJobSpec` but stores the logical definition rather than freezing the preview. Its response includes the Job ID and an optional `initial_plan`; the preview is absent when the current snapshot has no complete feasible plan, but the logical job can still be accepted. Each role is implementation-selected when its real dependencies complete. If no implementation is feasible then, the role remains `Ready`; later agent polling retries it against current membership, topology, and Object replicas. This is what allows a hot-joined resource to change a downstream implementation choice after submission.
 
 ## Object metadata and data plane
 
 Object metadata is published to `POST /v1/objects/publish`. When an agent fetches an existing object into its local cache, it records the new physical replica through `POST /v1/objects/replica`.
 
-Bulk bytes do **not** pass through the coordinator. In v0.4 each agent exposes:
+Bulk bytes do **not** pass through the coordinator. In v0.5 each agent exposes:
 
 - `POST /v1/objects` — stage bytes into the local SHA-256 CAS and create logical object metadata;
 - `GET /v1/blobs/{sha256}` — serve immutable bytes directly to another agent.
@@ -72,7 +72,7 @@ The prototype accepts measured links at `POST /v1/topology/link`. Links carry RT
 | `GET /v1/tasks/{id}` | inspect task state |
 | `POST /v1/jobs` | submit cooperative role graph |
 | `POST /v1/jobs/plan` | preview implementation choices and predicted placements for a logical job |
-| `POST /v1/jobs/auto` | plan and submit a logical job |
+| `POST /v1/jobs/auto` | submit a logical job for ready-time implementation replanning |
 | `GET /v1/jobs/{id}` | inspect cooperative job and role states |
 | `POST /v1/topology/link` | update measured link |
 
@@ -80,4 +80,4 @@ The prototype accepts measured links at `POST /v1/topology/link`. Links carry RT
 
 Resource capabilities and task features use extensible string identifiers where premature closed enums would block new accelerator/runtime types. Wire-version negotiation and backward compatibility are not implemented yet.
 
-The v0.4 service is **unauthenticated** and defaults to loopback. Cross-trust-domain authentication, authorization, TLS, signed artifacts, and secret locality are design requirements in `security.md`, not claims of the current implementation.
+The v0.5 service is **unauthenticated** and defaults to loopback. Cross-trust-domain authentication, authorization, TLS, signed artifacts, and secret locality are design requirements in `security.md`, not claims of the current implementation.

@@ -1,11 +1,11 @@
 use plurifold_core::{
-    CooperativeJobSpec, ExecutionLease, JobId, LinkProfile, LogicalJobSpec, MembershipLease,
-    ObjectId, ObjectMetadata, ResourceDescriptor, ResourceId, TaskId, TaskSpec,
+    CooperativeJobSpec, ExecutionLease, JobDefinition, JobId, LinkProfile, LogicalJobSpec,
+    MembershipLease, ObjectId, ObjectMetadata, ResourceDescriptor, ResourceId, TaskId, TaskSpec,
 };
 use plurifold_runtime::{CooperativeJobStatus, CooperativePlan, CooperativeRoleView, TaskStatus};
 use serde::{Deserialize, Serialize};
 
-pub const API_VERSION: u32 = 1;
+pub const API_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RegisterResourceRequest {
@@ -102,14 +102,14 @@ pub struct PlanLogicalJobRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SubmitPlannedJobResponse {
+pub struct SubmitLogicalJobResponse {
     pub job_id: JobId,
-    pub plan: CooperativePlan,
+    pub initial_plan: Option<CooperativePlan>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CooperativeJobView {
-    pub job: CooperativeJobSpec,
+    pub job: JobDefinition,
     pub status: CooperativeJobStatus,
     pub roles: Vec<CooperativeRoleView>,
 }

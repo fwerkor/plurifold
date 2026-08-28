@@ -11,7 +11,7 @@ use plurifold_core::{
 use plurifold_protocol::{
     CooperativeJobView, ErrorResponse, LinkUpdateRequest, PlanLogicalJobRequest,
     PublishObjectRequest, PutObjectResponse, ResourceListResponse, SubmitCooperativeJobRequest,
-    SubmitCooperativeJobResponse, SubmitPlannedJobResponse, SubmitTaskRequest, SubmitTaskResponse,
+    SubmitCooperativeJobResponse, SubmitLogicalJobResponse, SubmitTaskRequest, SubmitTaskResponse,
     TaskView,
 };
 use plurifold_runtime::{CooperativeJobStatus, CooperativePlan, Fabric, TaskStatus};
@@ -113,7 +113,7 @@ enum JobCommand {
         #[arg(long)]
         file: PathBuf,
     },
-    /// Plan a logical job against current resources and submit the generated cooperative job.
+    /// Submit a logical job whose ready roles are dynamically replanned against current state.
     AutoSubmit {
         #[arg(long)]
         coordinator: String,
@@ -355,7 +355,7 @@ async fn auto_submit_job(
     client: &Client,
     coordinator: &str,
     job: LogicalJobSpec,
-) -> Result<SubmitPlannedJobResponse, Box<dyn std::error::Error>> {
+) -> Result<SubmitLogicalJobResponse, Box<dyn std::error::Error>> {
     let response = checked(
         client
             .post(format!("{}/v1/jobs/auto", base(coordinator)))

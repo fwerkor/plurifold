@@ -247,6 +247,13 @@ pub struct LogicalJobSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "spec", rename_all = "snake_case")]
+pub enum JobDefinition {
+    Cooperative(CooperativeJobSpec),
+    Logical(LogicalJobSpec),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ObjectMetadata {
     pub id: ObjectId,
     pub size_bytes: u64,

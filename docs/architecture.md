@@ -29,11 +29,13 @@ Cooperative Job
 
 ### Logical planner
 
-A `LogicalJobSpec` keeps the role/dependency graph explicit but allows each role to advertise multiple Task implementations. The planner compiles that logical graph into one concrete `CooperativeJobSpec` using a snapshot of currently schedulable resources, object locations, and topology.
+A `LogicalJobSpec` keeps the role/dependency graph explicit but allows each role to advertise multiple Task implementations. A snapshot planner can preview a concrete `CooperativeJobSpec`, but v0.5 logical execution keeps the alternatives live instead of treating that preview as the execution contract.
 
 For each ready role it scores implementation/resource pairs with the ordinary topology-aware scheduler. Predicted predecessor outputs are represented as temporary planning objects located at the chosen predecessor resources, with size derived from the selected implementation's output-size hint. This lets a downstream choice account for the communication cost created by upstream choices instead of selecting every role independently.
 
-The planner also tracks predicted resource availability so independent roles can be spread across idle resources rather than accidentally serialized on one worker. Its placement output is advisory: execution-time scheduling remains authoritative and may choose another compatible resource if membership or locality changes after planning.
+The preview planner also tracks predicted resource availability so independent roles can be spread across idle resources rather than accidentally serialized on one worker. Its placement output is advisory.
+
+For `auto-submit`, a role is concretized only when all of its predecessors have actually completed. At that point the runtime scores its implementation alternatives against the current schedulable resources, current topology, and the real published predecessor Object locations/sizes. A role with satisfied dependencies but no feasible implementation enters `Ready`; agent polling retries ready roles, so a later resource hot join can make progress without resubmitting the logical job. The resulting Task then follows the ordinary scheduler and execution-lease path.
 
 ### Graph runtime
 

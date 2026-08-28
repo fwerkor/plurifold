@@ -14,7 +14,7 @@ use plurifold_protocol::{
     LinkUpdateRequest, ObjectReplica, PlanLogicalJobRequest, PublishObjectRequest,
     RegisterReplicaRequest, RegisterResourceRequest, RegisterResourceResponse,
     RenewExecutionRequest, ResolvedObject, ResourceListResponse, ResourceView,
-    SubmitCooperativeJobRequest, SubmitCooperativeJobResponse, SubmitPlannedJobResponse,
+    SubmitCooperativeJobRequest, SubmitCooperativeJobResponse, SubmitLogicalJobResponse,
     SubmitTaskRequest, SubmitTaskResponse, TaskView, WorkAssignment, WorkPollRequest,
     WorkPollResponse,
 };
@@ -127,6 +127,10 @@ async fn poll_work(
     if current_epoch != request.epoch {
         return Err(ApiError::conflict("resource epoch is stale"));
     }
+    state
+        .fabric
+        .refresh_ready_roles()
+        .map_err(ApiError::from_fabric)?;
 
     for task_id in state.fabric.pending_task_ids() {
         let decision = match state.fabric.schedule_task(task_id) {
@@ -313,17 +317,21 @@ async fn plan_logical_job(
 async fn submit_planned_job(
     State(coordinator): State<Coordinator>,
     Json(request): Json<PlanLogicalJobRequest>,
-) -> Result<Json<SubmitPlannedJobResponse>, ApiError> {
+) -> Result<Json<SubmitLogicalJobResponse>, ApiError> {
     let mut state = coordinator.inner.lock().await;
-    let plan = state
-        .fabric
-        .plan_logical_job(&request.job)
-        .map_err(ApiError::from_plan)?;
+    let initial_plan = match state.fabric.plan_logical_job(&request.job) {
+        Ok(plan) => Some(plan),
+        Err(PlanError::NoFeasibleImplementation(_)) => None,
+        Err(error) => return Err(ApiError::from_plan(error)),
+    };
     let job_id = state
         .fabric
-        .submit_cooperative(plan.job.clone())
+        .submit_logical(request.job)
         .map_err(ApiError::from_fabric)?;
-    Ok(Json(SubmitPlannedJobResponse { job_id, plan }))
+    Ok(Json(SubmitLogicalJobResponse {
+        job_id,
+        initial_plan,
+    }))
 }
 
 async fn get_cooperative_job(
@@ -335,7 +343,7 @@ async fn get_cooperative_job(
     let state = coordinator.inner.lock().await;
     let job = state
         .fabric
-        .cooperative_job_spec(job_id)
+        .job_definition(job_id)
         .cloned()
         .ok_or_else(|| ApiError::not_found("cooperative job not found"))?;
     let status = state
@@ -422,7 +430,9 @@ impl ApiError {
             | FabricError::StaleExecution
             | FabricError::ExecutionExpired
             | FabricError::StaleResourceEpoch(_) => StatusCode::CONFLICT,
-            FabricError::InvalidCooperativeJob(_) => StatusCode::BAD_REQUEST,
+            FabricError::InvalidCooperativeJob(_) | FabricError::InvalidLogicalJob(_) => {
+                StatusCode::BAD_REQUEST
+            }
             FabricError::Scheduling(_) => StatusCode::UNPROCESSABLE_ENTITY,
         };
         Self {

@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use plurifold_core::{
-    CooperativeJobSpec, ExecutionId, ExecutionLease, JobId, LogicalJobSpec, MembershipLease,
-    ObjectId, ObjectMetadata, ResourceDescriptor, ResourceId, TaskId, TaskSpec, TopologySnapshot,
+    CooperativeJobSpec, ExecutionId, ExecutionLease, JobDefinition, JobId, LogicalJobSpec,
+    MembershipLease, ObjectId, ObjectMetadata, ResourceDescriptor, ResourceId, TaskId, TaskSpec,
+    TopologySnapshot,
 };
 use plurifold_scheduler::{PlacementDecision, ScheduleError, TopologyAwareScheduler};
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,8 @@ pub enum TaskStatus {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum CooperativeRoleStatus {
     Waiting,
+    /// Dependencies are complete, but no implementation is currently feasible.
+    Ready,
     Submitted(TaskId),
     Completed(Vec<ObjectId>),
     Uncertain,
@@ -42,6 +45,9 @@ pub struct CooperativeRoleView {
     pub name: String,
     pub depends_on: Vec<String>,
     pub status: CooperativeRoleStatus,
+    pub implementation: Option<String>,
+    pub planned_resource: Option<ResourceId>,
+    pub estimated_total_ms: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -58,8 +64,16 @@ struct TaskRecord {
 
 #[derive(Clone, Debug)]
 struct CooperativeJobRecord {
-    spec: CooperativeJobSpec,
+    definition: JobDefinition,
     roles: HashMap<String, CooperativeRoleStatus>,
+    selections: HashMap<String, RoleSelection>,
+}
+
+#[derive(Clone, Debug)]
+struct RoleSelection {
+    implementation: String,
+    planned_resource: ResourceId,
+    estimated_total_ms: f64,
 }
 
 #[derive(Debug, Error)]
@@ -82,6 +96,8 @@ pub enum FabricError {
     DuplicateJob(JobId),
     #[error("invalid cooperative job: {0}")]
     InvalidCooperativeJob(String),
+    #[error("invalid logical job: {0}")]
+    InvalidLogicalJob(String),
     #[error("task {0} is not pending")]
     TaskNotPending(TaskId),
     #[error("execution lease is stale or does not own the task")]
@@ -270,14 +286,48 @@ impl Fabric {
             .iter()
             .map(|role| (role.name.clone(), CooperativeRoleStatus::Waiting))
             .collect();
-        self.jobs
-            .insert(job_id, CooperativeJobRecord { spec: job, roles });
+        self.jobs.insert(
+            job_id,
+            CooperativeJobRecord {
+                definition: JobDefinition::Cooperative(job),
+                roles,
+                selections: HashMap::new(),
+            },
+        );
         self.materialize_ready_roles(job_id)?;
         Ok(job_id)
     }
 
-    pub fn cooperative_job_spec(&self, job_id: JobId) -> Option<&CooperativeJobSpec> {
-        self.jobs.get(&job_id).map(|record| &record.spec)
+    pub fn submit_logical(&mut self, job: LogicalJobSpec) -> Result<JobId, FabricError> {
+        planner::validate_logical_job(&job).map_err(|error| match error {
+            PlanError::InvalidLogicalJob(message) => FabricError::InvalidLogicalJob(message),
+            PlanError::NoFeasibleImplementation(_) => {
+                unreachable!("validation does not place roles")
+            }
+        })?;
+        let job_id = job.id;
+        if self.jobs.contains_key(&job_id) {
+            return Err(FabricError::DuplicateJob(job_id));
+        }
+        let roles = job
+            .roles
+            .iter()
+            .map(|role| (role.name.clone(), CooperativeRoleStatus::Waiting))
+            .collect();
+        self.jobs.insert(
+            job_id,
+            CooperativeJobRecord {
+                definition: JobDefinition::Logical(job),
+                roles,
+                selections: HashMap::new(),
+            },
+        );
+        self.materialize_ready_roles(job_id)?;
+        Ok(job_id)
+    }
+
+    pub fn job_definition(&self, job_id: JobId) -> Option<&JobDefinition> {
+        self.jobs.get(&job_id).map(|record| &record.definition)
     }
 
     pub fn cooperative_job_status(&self, job_id: JobId) -> Option<CooperativeJobStatus> {
@@ -296,9 +346,7 @@ impl Fabric {
         {
             return Some(CooperativeJobStatus::Running);
         }
-        let outputs = record
-            .spec
-            .outputs
+        let outputs = job_outputs(&record.definition)
             .iter()
             .flat_map(|role_name| match record.roles.get(role_name) {
                 Some(CooperativeRoleStatus::Completed(outputs)) => outputs.clone(),
@@ -311,18 +359,28 @@ impl Fabric {
     pub fn cooperative_role_views(&self, job_id: JobId) -> Option<Vec<CooperativeRoleView>> {
         let record = self.jobs.get(&job_id)?;
         Some(
-            record
-                .spec
-                .roles
-                .iter()
-                .map(|role| CooperativeRoleView {
-                    name: role.name.clone(),
-                    depends_on: role.depends_on.clone(),
+            job_roles(&record.definition)
+                .into_iter()
+                .map(|(name, depends_on)| CooperativeRoleView {
                     status: record
                         .roles
-                        .get(&role.name)
+                        .get(&name)
                         .cloned()
                         .expect("validated cooperative role has runtime state"),
+                    implementation: record
+                        .selections
+                        .get(&name)
+                        .map(|selection| selection.implementation.clone()),
+                    planned_resource: record
+                        .selections
+                        .get(&name)
+                        .map(|selection| selection.planned_resource),
+                    estimated_total_ms: record
+                        .selections
+                        .get(&name)
+                        .map(|selection| selection.estimated_total_ms),
+                    name,
+                    depends_on,
                 })
                 .collect(),
         )
@@ -560,40 +618,115 @@ impl Fabric {
         }
     }
 
+    pub fn refresh_ready_roles(&mut self) -> Result<(), FabricError> {
+        let job_ids = self.jobs.keys().copied().collect::<Vec<_>>();
+        for job_id in job_ids {
+            self.materialize_ready_roles(job_id)?;
+        }
+        Ok(())
+    }
+
     fn materialize_ready_roles(&mut self, job_id: JobId) -> Result<(), FabricError> {
+        enum ReadyRole {
+            Cooperative {
+                name: String,
+                task: TaskSpec,
+            },
+            Logical {
+                name: String,
+                role: plurifold_core::LogicalRoleSpec,
+                dependency_inputs: Vec<ObjectId>,
+            },
+        }
+
         let ready = {
             let job = self
                 .jobs
                 .get(&job_id)
                 .ok_or(FabricError::UnknownJob(job_id))?;
-            job.spec
-                .roles
-                .iter()
-                .filter(|role| job.roles.get(&role.name) == Some(&CooperativeRoleStatus::Waiting))
-                .filter_map(|role| {
-                    let mut dependency_inputs = Vec::new();
-                    for dependency in &role.depends_on {
-                        match job.roles.get(dependency) {
-                            Some(CooperativeRoleStatus::Completed(outputs)) => {
-                                dependency_inputs.extend(outputs.iter().copied());
+            match &job.definition {
+                JobDefinition::Cooperative(spec) => spec
+                    .roles
+                    .iter()
+                    .filter(|role| {
+                        job.roles.get(&role.name) == Some(&CooperativeRoleStatus::Waiting)
+                    })
+                    .filter_map(|role| {
+                        dependency_outputs(&job.roles, &role.depends_on).map(|inputs| {
+                            ReadyRole::Cooperative {
+                                name: role.name.clone(),
+                                task: role.task.instantiate(inputs),
                             }
-                            _ => return None,
-                        }
-                    }
-                    Some((role.name.clone(), role.task.instantiate(dependency_inputs)))
-                })
-                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+                JobDefinition::Logical(spec) => spec
+                    .roles
+                    .iter()
+                    .filter(|role| {
+                        matches!(
+                            job.roles.get(&role.name),
+                            Some(CooperativeRoleStatus::Waiting | CooperativeRoleStatus::Ready)
+                        )
+                    })
+                    .filter_map(|role| {
+                        dependency_outputs(&job.roles, &role.depends_on).map(|inputs| {
+                            ReadyRole::Logical {
+                                name: role.name.clone(),
+                                role: role.clone(),
+                                dependency_inputs: inputs,
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            }
         };
 
-        for (role_name, task) in ready {
+        for ready_role in ready {
+            let (role_name, task, selection) = match ready_role {
+                ReadyRole::Cooperative { name, task } => (name, task, None),
+                ReadyRole::Logical {
+                    name,
+                    role,
+                    dependency_inputs,
+                } => {
+                    let resources = self.schedulable_resources();
+                    let Some(selected) = planner::select_ready_role(
+                        &role,
+                        &dependency_inputs,
+                        &self.scheduler,
+                        &resources,
+                        &self.objects,
+                        &self.topology,
+                    ) else {
+                        self.jobs
+                            .get_mut(&job_id)
+                            .expect("logical job existence checked above")
+                            .roles
+                            .insert(name, CooperativeRoleStatus::Ready);
+                        continue;
+                    };
+                    let selection = RoleSelection {
+                        implementation: selected.implementation,
+                        planned_resource: selected.resource_id,
+                        estimated_total_ms: selected.cost.total_ms,
+                    };
+                    (name, selected.task, Some(selection))
+                }
+            };
+
             let task_id = task.id;
             self.submit(task)?;
             self.task_roles.insert(task_id, (job_id, role_name.clone()));
-            self.jobs
+            let job = self
+                .jobs
                 .get_mut(&job_id)
-                .expect("cooperative job existence checked above")
-                .roles
-                .insert(role_name, CooperativeRoleStatus::Submitted(task_id));
+                .expect("job existence checked above");
+            job.roles
+                .insert(role_name.clone(), CooperativeRoleStatus::Submitted(task_id));
+            if let Some(selection) = selection {
+                job.selections.insert(role_name, selection);
+            }
         }
         Ok(())
     }
@@ -629,6 +762,44 @@ impl Fabric {
     }
 }
 
+fn job_outputs(definition: &JobDefinition) -> &[String] {
+    match definition {
+        JobDefinition::Cooperative(spec) => &spec.outputs,
+        JobDefinition::Logical(spec) => &spec.outputs,
+    }
+}
+
+fn job_roles(definition: &JobDefinition) -> Vec<(String, Vec<String>)> {
+    match definition {
+        JobDefinition::Cooperative(spec) => spec
+            .roles
+            .iter()
+            .map(|role| (role.name.clone(), role.depends_on.clone()))
+            .collect(),
+        JobDefinition::Logical(spec) => spec
+            .roles
+            .iter()
+            .map(|role| (role.name.clone(), role.depends_on.clone()))
+            .collect(),
+    }
+}
+
+fn dependency_outputs(
+    statuses: &HashMap<String, CooperativeRoleStatus>,
+    dependencies: &[String],
+) -> Option<Vec<ObjectId>> {
+    let mut inputs = Vec::new();
+    for dependency in dependencies {
+        match statuses.get(dependency) {
+            Some(CooperativeRoleStatus::Completed(outputs)) => {
+                inputs.extend(outputs.iter().copied());
+            }
+            _ => return None,
+        }
+    }
+    Some(inputs)
+}
+
 fn same_object_identity(left: &ObjectMetadata, right: &ObjectMetadata) -> bool {
     left.id == right.id
         && left.size_bytes == right.size_bytes
@@ -662,7 +833,8 @@ mod tests {
 
     use plurifold_core::{
         Architecture, CooperativeJobSpec, CooperativeRoleSpec, CostHint, EffectSemantics,
-        ObjectMetadata, ResourceRequirements, TaskSpec, TaskTemplate,
+        LogicalJobSpec, LogicalRoleSpec, ObjectMetadata, ResourceRequirements, RoleImplementation,
+        TaskSpec, TaskTemplate,
     };
 
     use super::*;
@@ -705,6 +877,32 @@ mod tests {
             requirements: ResourceRequirements::default(),
             effects,
             cost: CostHint::default(),
+        }
+    }
+
+    fn logical_implementation(
+        name: &str,
+        feature: &str,
+        compute_ms: f64,
+        output_bytes: u64,
+    ) -> RoleImplementation {
+        RoleImplementation {
+            name: name.into(),
+            task: TaskTemplate {
+                artifact: "builtin:identity".into(),
+                entrypoint: "run".into(),
+                arguments: vec![],
+                inputs: vec![],
+                requirements: ResourceRequirements {
+                    required_features: BTreeSet::from([feature.to_owned()]),
+                    ..ResourceRequirements::default()
+                },
+                effects: EffectSemantics::Pure,
+                cost: CostHint {
+                    compute_ms_on_reference: compute_ms,
+                    output_bytes,
+                },
+            },
         }
     }
 
@@ -1022,5 +1220,124 @@ mod tests {
             fabric.cooperative_job_status(job_id),
             Some(CooperativeJobStatus::Uncertain)
         );
+    }
+
+    #[test]
+    fn logical_role_waits_until_a_compatible_resource_joins() {
+        let mut fabric = Fabric::new(10_000, 10_000);
+        let job_id = JobId::new();
+        fabric
+            .submit_logical(LogicalJobSpec {
+                id: job_id,
+                roles: vec![LogicalRoleSpec {
+                    name: "compute".into(),
+                    implementations: vec![logical_implementation(
+                        "specialized",
+                        "backend:special",
+                        10.0,
+                        1,
+                    )],
+                    depends_on: vec![],
+                }],
+                outputs: vec!["compute".into()],
+            })
+            .unwrap();
+
+        let view = fabric.cooperative_role_views(job_id).unwrap();
+        assert_eq!(view[0].status, CooperativeRoleStatus::Ready);
+        assert!(fabric.pending_task_ids().is_empty());
+
+        let worker = ResourceId::new();
+        let mut descriptor = resource(worker);
+        descriptor.features.insert("backend:special".into());
+        fabric.register_resource(descriptor);
+        fabric.refresh_ready_roles().unwrap();
+
+        let view = fabric.cooperative_role_views(job_id).unwrap();
+        assert!(matches!(
+            view[0].status,
+            CooperativeRoleStatus::Submitted(_)
+        ));
+        assert_eq!(view[0].implementation.as_deref(), Some("specialized"));
+        assert_eq!(view[0].planned_resource, Some(worker));
+    }
+
+    #[test]
+    fn downstream_logical_role_replans_when_a_better_resource_joins_before_readiness() {
+        let mut fabric = Fabric::new(10_000, 10_000);
+        let left = ResourceId::new();
+        let mut left_resource = resource(left);
+        left_resource
+            .features
+            .extend(["role:root".to_owned(), "join:slow".to_owned()]);
+        fabric.register_resource(left_resource);
+
+        let job_id = JobId::new();
+        let logical = LogicalJobSpec {
+            id: job_id,
+            roles: vec![
+                LogicalRoleSpec {
+                    name: "root".into(),
+                    implementations: vec![logical_implementation(
+                        "root-left",
+                        "role:root",
+                        100.0,
+                        1,
+                    )],
+                    depends_on: vec![],
+                },
+                LogicalRoleSpec {
+                    name: "join".into(),
+                    implementations: vec![
+                        logical_implementation("slow-left", "join:slow", 1_000.0, 1),
+                        logical_implementation("fast-new", "join:fast", 10.0, 1),
+                    ],
+                    depends_on: vec!["root".into()],
+                },
+            ],
+            outputs: vec!["join".into()],
+        };
+
+        let preview = fabric.plan_logical_job(&logical).unwrap();
+        assert_eq!(preview.roles[1].implementation, "slow-left");
+        fabric.submit_logical(logical).unwrap();
+
+        let root_task = fabric.pending_task_ids()[0];
+        let root_lease = fabric.begin_execution(root_task, left).unwrap();
+
+        let newcomer = ResourceId::new();
+        let mut newcomer_resource = resource(newcomer);
+        newcomer_resource.features.insert("join:fast".into());
+        fabric.register_resource(newcomer_resource);
+        fabric.upsert_link(plurifold_core::LinkProfile {
+            from: left,
+            to: newcomer,
+            rtt_ms: 1.0,
+            bandwidth_mbps: 10_000.0,
+        });
+
+        fabric
+            .complete_execution(
+                &root_lease,
+                vec![ObjectMetadata {
+                    id: ObjectId::new(),
+                    size_bytes: 1,
+                    digest: Some("sha256:root".into()),
+                    encoding: None,
+                    locations: vec![left],
+                    producer: Some(root_task),
+                }],
+            )
+            .unwrap();
+
+        let join = fabric
+            .cooperative_role_views(job_id)
+            .unwrap()
+            .into_iter()
+            .find(|role| role.name == "join")
+            .unwrap();
+        assert_eq!(join.implementation.as_deref(), Some("fast-new"));
+        assert_eq!(join.planned_resource, Some(newcomer));
+        assert!(matches!(join.status, CooperativeRoleStatus::Submitted(_)));
     }
 }

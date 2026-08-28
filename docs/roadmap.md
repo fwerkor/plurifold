@@ -40,7 +40,10 @@
 - [x] logical role graphs with multiple implementation alternatives
 - [x] automatic implementation/resource planning from current capabilities, locality, and topology
 - [x] predicted intermediate-transfer cost and resource-availability-aware makespan planning
-- [x] plan preview and plan-and-submit control-plane/CLI paths
+- [x] snapshot plan preview plus dynamic logical-job submit control-plane/CLI paths
+- [x] ready-time implementation replanning using actual predecessor Object replicas and current topology
+- [x] `Ready` roles that wait for compatible hot-joined resources instead of failing submission
+- [x] multi-process hot-join E2E where downstream implementation choice changes after submission
 - [ ] dynamic role insertion while a job is running
 - [ ] automatic role-boundary inference/decomposition from higher-level computation graphs or source programs
 - [ ] elastic role replication and quorum/reduction policies
@@ -59,7 +62,7 @@
 - [ ] CUDA executor adapter
 - [ ] ROCm executor adapter
 - [ ] Ascend/CANN executor adapter
-- [ ] multi-implementation task selection
+- [ ] real accelerator-backed implementation selection through CUDA/ROCm/CANN executors
 - [ ] site-local collective groups
 
 ## Phase 5 — Stateful primitives

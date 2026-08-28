@@ -59,6 +59,45 @@ struct Candidate<'a> {
     cost: PlacementBreakdown,
 }
 
+pub(crate) struct ReadyRoleSelection {
+    pub implementation: String,
+    pub task: plurifold_core::TaskSpec,
+    pub resource_id: ResourceId,
+    pub cost: PlacementBreakdown,
+}
+
+pub(crate) fn select_ready_role(
+    role: &plurifold_core::LogicalRoleSpec,
+    dependency_inputs: &[ObjectId],
+    scheduler: &TopologyAwareScheduler,
+    resources: &[ResourceDescriptor],
+    objects: &HashMap<ObjectId, ObjectMetadata>,
+    topology: &TopologySnapshot,
+) -> Option<ReadyRoleSelection> {
+    let mut best: Option<ReadyRoleSelection> = None;
+    for implementation in &role.implementations {
+        let task = implementation
+            .task
+            .instantiate(dependency_inputs.iter().copied());
+        let Ok(decision) = scheduler.choose(&task, resources, objects, topology) else {
+            continue;
+        };
+        let replace = best
+            .as_ref()
+            .map(|current| decision.cost.total_ms < current.cost.total_ms)
+            .unwrap_or(true);
+        if replace {
+            best = Some(ReadyRoleSelection {
+                implementation: implementation.name.clone(),
+                task,
+                resource_id: decision.resource_id,
+                cost: decision.cost,
+            });
+        }
+    }
+    best
+}
+
 pub(crate) fn plan(
     spec: &LogicalJobSpec,
     scheduler: &TopologyAwareScheduler,
@@ -270,7 +309,7 @@ fn feasible_candidate_count(
         .sum()
 }
 
-fn validate_logical_job(spec: &LogicalJobSpec) -> Result<(), PlanError> {
+pub(crate) fn validate_logical_job(spec: &LogicalJobSpec) -> Result<(), PlanError> {
     validate_role_graph(
         spec.roles
             .iter()

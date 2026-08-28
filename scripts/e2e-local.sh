@@ -8,9 +8,11 @@ BASE_PORT=${PLURIFOLD_E2E_PORT_BASE:-19180}
 COORD_PORT=$BASE_PORT
 A_PORT=$((BASE_PORT + 1))
 B_PORT=$((BASE_PORT + 2))
+C_PORT=$((BASE_PORT + 3))
 COORD="http://127.0.0.1:${COORD_PORT}"
 A_URL="http://127.0.0.1:${A_PORT}"
 B_URL="http://127.0.0.1:${B_PORT}"
+C_URL="http://127.0.0.1:${C_PORT}"
 TMP=$(mktemp -d)
 PIDS=()
 
@@ -366,6 +368,21 @@ cat >"$TMP/logical-job.json" <<JSON
             "effects": "Pure",
             "cost": {"compute_ms_on_reference": 100.0, "output_bytes": 21}
           }
+        },
+        {
+          "name": "join-fast",
+          "task": {
+            "artifact": "builtin:concat",
+            "entrypoint": "run",
+            "requirements": {
+              "architecture": null,
+              "min_memory_bytes": 0,
+              "accelerator": null,
+              "required_features": ["demo:join-fast"]
+            },
+            "effects": "Pure",
+            "cost": {"compute_ms_on_reference": 100.0, "output_bytes": 21}
+          }
         }
       ],
       "depends_on": ["left", "right"]
@@ -414,10 +431,57 @@ done
 [[ "$AUTO_LEFT_RESOURCE" == "$A_ID" ]]
 [[ "$AUTO_RIGHT_RESOURCE" == "$B_ID" ]]
 
+./target/debug/plurifold-agent run \
+  --name worker-c \
+  --performance 20 \
+  --feature demo:join-fast \
+  --coordinator "$COORD" \
+  --bind "127.0.0.1:${C_PORT}" \
+  --advertise "$C_URL" \
+  --store-dir "$TMP/c" \
+  --heartbeat-interval-ms 150 \
+  --poll-interval-ms 50 \
+  >"$TMP/worker-c.log" 2>&1 &
+C_PID=$!
+PIDS+=("$C_PID")
+wait_http "$C_URL/healthz"
+
+for _ in $(seq 1 100); do
+  RESOURCES=$(./target/debug/plurifold resources --coordinator "$COORD")
+  COUNT=$(printf '%s' "$RESOURCES" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["resources"]))')
+  if [[ "$COUNT" == "3" ]]; then
+    break
+  fi
+  sleep 0.05
+done
+[[ "${COUNT:-0}" == "3" ]]
+C_ID=$(printf '%s' "$RESOURCES" | json_resource_id worker-c)
+
+./target/debug/plurifold link --coordinator "$COORD" --from "$A_ID" --to "$C_ID" --rtt-ms 1 --bandwidth-mbps 10000
+./target/debug/plurifold link --coordinator "$COORD" --from "$B_ID" --to "$C_ID" --rtt-ms 1 --bandwidth-mbps 10000
+
 ./target/debug/plurifold job wait --coordinator "$COORD" --job "$AUTO_JOB" --timeout-s 10 >/dev/null
 AUTO_EXPECTED=$(printf 'auto-left|auto-right\n' | sha256sum | awk '{print $1}')
-[[ -f "$TMP/a/sha256/$AUTO_EXPECTED" ]]
-echo "auto-planner: ok (left-native->$AUTO_LEFT_RESOURCE, right-native->$AUTO_RIGHT_RESOURCE, join-left predicted on worker-a)"
+[[ -f "$TMP/c/sha256/$AUTO_EXPECTED" ]]
+AUTO_FINAL_VIEW=$(./target/debug/plurifold job status --coordinator "$COORD" --job "$AUTO_JOB")
+printf '%s' "$AUTO_FINAL_VIEW" | python3 -c 'import json,sys
+data=json.load(sys.stdin)
+join=next(role for role in data["roles"] if role["name"] == "join")
+assert join["implementation"] == "join-fast", join
+assert join["planned_resource"] == sys.argv[1], join
+' "$C_ID"
+echo "dynamic-replan: ok (preview join-left->$A_ID, ready-time join-fast->$C_ID after hot join)"
+
+kill "$C_PID"
+C_PID=0
+for _ in $(seq 1 50); do
+  ACTIVE=$(./target/debug/plurifold resources --coordinator "$COORD" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["resources"]))')
+  if [[ "$ACTIVE" == "2" ]]; then
+    break
+  fi
+  sleep 0.05
+done
+[[ "${ACTIVE:-0}" == "2" ]]
 
 FAILURE_TASK=$(./target/debug/plurifold submit \
   --coordinator "$COORD" \
