@@ -2,7 +2,7 @@
 
 ## Task
 
-A Task is a logical computation. It declares:
+A Task is one schedulable execution unit. It declares:
 
 - artifact/entrypoint identity;
 - input Object IDs;
@@ -12,7 +12,23 @@ A Task is a logical computation. It declares:
 - optional affinity/anti-affinity hints;
 - optional checkpoint capability.
 
-The first implementation treats a Task as one-shot work. Dynamic graph construction is allowed: a completed task may cause more tasks to be submitted.
+Tasks remain one-shot work. Dynamic graph construction is allowed: a completed task may make additional tasks runnable.
+
+## Cooperative Job
+
+A Cooperative Job is one logical objective implemented by multiple named roles. Each role contains a Task template and a dependency list. Independent roles become schedulable together and can be placed on different resources according to their individual capability requirements. A dependent role is materialized only after every predecessor completes; predecessor output Object IDs are appended to the dependent Task's inputs in dependency order.
+
+For example:
+
+```text
+preprocess (CPU) ─┐
+                  ├─ aggregate (large-memory CPU) -> result
+simulate (GPU) ───┘
+```
+
+The job is the logical unit seen by the application, while each Task retains its own execution lease, retry semantics, placement decision, and output objects. If an `Exclusive` role loses an ambiguous execution attempt, the containing job becomes `Uncertain`. Pure or idempotent role tasks keep the existing replay behavior.
+
+The v0.3 implementation uses an explicit static role graph. It does not yet infer role decomposition from arbitrary code or split one instruction-level computation across unrelated devices. Future graph planning can generate the same role/task representation without changing the execution protocol.
 
 ## Object
 

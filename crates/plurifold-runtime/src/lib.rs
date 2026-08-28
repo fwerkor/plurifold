@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use plurifold_core::{
-    ExecutionId, ExecutionLease, MembershipLease, ObjectId, ObjectMetadata, ResourceDescriptor,
-    ResourceId, TaskId, TaskSpec, TopologySnapshot,
+    CooperativeJobSpec, ExecutionId, ExecutionLease, JobId, MembershipLease, ObjectId,
+    ObjectMetadata, ResourceDescriptor, ResourceId, TaskId, TaskSpec, TopologySnapshot,
 };
 use plurifold_scheduler::{PlacementDecision, ScheduleError, TopologyAwareScheduler};
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,28 @@ pub enum TaskStatus {
     Uncertain,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum CooperativeRoleStatus {
+    Waiting,
+    Submitted(TaskId),
+    Completed(Vec<ObjectId>),
+    Uncertain,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum CooperativeJobStatus {
+    Running,
+    Completed(Vec<ObjectId>),
+    Uncertain,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CooperativeRoleView {
+    pub name: String,
+    pub depends_on: Vec<String>,
+    pub status: CooperativeRoleStatus,
+}
+
 #[derive(Clone, Debug)]
 struct RegisteredResource {
     descriptor: ResourceDescriptor,
@@ -28,6 +50,12 @@ struct RegisteredResource {
 struct TaskRecord {
     spec: TaskSpec,
     status: TaskStatus,
+}
+
+#[derive(Clone, Debug)]
+struct CooperativeJobRecord {
+    spec: CooperativeJobSpec,
+    roles: HashMap<String, CooperativeRoleStatus>,
 }
 
 #[derive(Debug, Error)]
@@ -44,6 +72,12 @@ pub enum FabricError {
     ObjectConflict(ObjectId),
     #[error("task {0} already exists")]
     DuplicateTask(TaskId),
+    #[error("cooperative job {0} does not exist")]
+    UnknownJob(JobId),
+    #[error("cooperative job {0} already exists")]
+    DuplicateJob(JobId),
+    #[error("invalid cooperative job: {0}")]
+    InvalidCooperativeJob(String),
     #[error("task {0} is not pending")]
     TaskNotPending(TaskId),
     #[error("execution lease is stale or does not own the task")]
@@ -59,6 +93,8 @@ pub struct Fabric {
     resources: HashMap<ResourceId, RegisteredResource>,
     objects: HashMap<ObjectId, ObjectMetadata>,
     tasks: HashMap<TaskId, TaskRecord>,
+    jobs: HashMap<JobId, CooperativeJobRecord>,
+    task_roles: HashMap<TaskId, (JobId, String)>,
     topology: TopologySnapshot,
     scheduler: TopologyAwareScheduler,
     membership_ttl_ms: u64,
@@ -77,6 +113,8 @@ impl Fabric {
             resources: HashMap::new(),
             objects: HashMap::new(),
             tasks: HashMap::new(),
+            jobs: HashMap::new(),
+            task_roles: HashMap::new(),
             topology: TopologySnapshot::default(),
             scheduler: TopologyAwareScheduler::default(),
             membership_ttl_ms,
@@ -217,6 +255,75 @@ impl Fabric {
         Ok(id)
     }
 
+    pub fn submit_cooperative(&mut self, job: CooperativeJobSpec) -> Result<JobId, FabricError> {
+        validate_cooperative_job(&job)?;
+        let job_id = job.id;
+        if self.jobs.contains_key(&job_id) {
+            return Err(FabricError::DuplicateJob(job_id));
+        }
+        let roles = job
+            .roles
+            .iter()
+            .map(|role| (role.name.clone(), CooperativeRoleStatus::Waiting))
+            .collect();
+        self.jobs
+            .insert(job_id, CooperativeJobRecord { spec: job, roles });
+        self.materialize_ready_roles(job_id)?;
+        Ok(job_id)
+    }
+
+    pub fn cooperative_job_spec(&self, job_id: JobId) -> Option<&CooperativeJobSpec> {
+        self.jobs.get(&job_id).map(|record| &record.spec)
+    }
+
+    pub fn cooperative_job_status(&self, job_id: JobId) -> Option<CooperativeJobStatus> {
+        let record = self.jobs.get(&job_id)?;
+        if record
+            .roles
+            .values()
+            .any(|status| *status == CooperativeRoleStatus::Uncertain)
+        {
+            return Some(CooperativeJobStatus::Uncertain);
+        }
+        if !record
+            .roles
+            .values()
+            .all(|status| matches!(status, CooperativeRoleStatus::Completed(_)))
+        {
+            return Some(CooperativeJobStatus::Running);
+        }
+        let outputs = record
+            .spec
+            .outputs
+            .iter()
+            .flat_map(|role_name| match record.roles.get(role_name) {
+                Some(CooperativeRoleStatus::Completed(outputs)) => outputs.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        Some(CooperativeJobStatus::Completed(outputs))
+    }
+
+    pub fn cooperative_role_views(&self, job_id: JobId) -> Option<Vec<CooperativeRoleView>> {
+        let record = self.jobs.get(&job_id)?;
+        Some(
+            record
+                .spec
+                .roles
+                .iter()
+                .map(|role| CooperativeRoleView {
+                    name: role.name.clone(),
+                    depends_on: role.depends_on.clone(),
+                    status: record
+                        .roles
+                        .get(&role.name)
+                        .cloned()
+                        .expect("validated cooperative role has runtime state"),
+                })
+                .collect(),
+        )
+    }
+
     pub fn task_status(&self, task_id: TaskId) -> Option<&TaskStatus> {
         self.tasks.get(&task_id).map(|record| &record.status)
     }
@@ -258,10 +365,23 @@ impl Fabric {
             return Err(FabricError::TaskNotPending(task_id));
         }
         let now = now_unix_ms();
+        let busy_resources: HashSet<_> = self
+            .tasks
+            .values()
+            .filter_map(|task| match &task.status {
+                TaskStatus::Running(lease) if lease.expires_at_unix_ms > now => {
+                    Some(lease.resource_id)
+                }
+                _ => None,
+            })
+            .collect();
         let active: Vec<_> = self
             .resources
             .values()
-            .filter(|resource| resource.expires_at_unix_ms > now)
+            .filter(|resource| {
+                resource.expires_at_unix_ms > now
+                    && !busy_resources.contains(&resource.descriptor.id)
+            })
             .map(|resource| resource.descriptor.clone())
             .collect();
         Ok(self
@@ -375,14 +495,15 @@ impl Fabric {
                 }
             }
         }
-        let output_ids = outputs.iter().map(|object| object.id).collect();
+        let output_ids: Vec<ObjectId> = outputs.iter().map(|object| object.id).collect();
         self.tasks
             .get_mut(&lease.task_id)
             .expect("task existence checked above")
-            .status = TaskStatus::Completed(output_ids);
+            .status = TaskStatus::Completed(output_ids.clone());
         for object in outputs {
             self.publish_object(object)?;
         }
+        self.complete_cooperative_role(lease.task_id, output_ids)?;
         Ok(())
     }
 
@@ -390,6 +511,7 @@ impl Fabric {
     /// uncertain and requires application/operator reconciliation.
     pub fn reap_expired_executions_at(&mut self, unix_ms: u64) -> Vec<TaskId> {
         let mut changed = Vec::new();
+        let mut uncertain = Vec::new();
         for (task_id, record) in &mut self.tasks {
             let expired = matches!(
                 &record.status,
@@ -401,11 +523,84 @@ impl Fabric {
             record.status = if record.spec.effects.automatically_retryable() {
                 TaskStatus::Pending
             } else {
+                uncertain.push(*task_id);
                 TaskStatus::Uncertain
             };
             changed.push(*task_id);
         }
+        for task_id in uncertain {
+            self.mark_cooperative_role_uncertain(task_id);
+        }
         changed
+    }
+
+    fn complete_cooperative_role(
+        &mut self,
+        task_id: TaskId,
+        outputs: Vec<ObjectId>,
+    ) -> Result<(), FabricError> {
+        let Some((job_id, role_name)) = self.task_roles.get(&task_id).cloned() else {
+            return Ok(());
+        };
+        let job = self
+            .jobs
+            .get_mut(&job_id)
+            .ok_or(FabricError::UnknownJob(job_id))?;
+        let status = job.roles.get_mut(&role_name).ok_or_else(|| {
+            FabricError::InvalidCooperativeJob(format!("runtime state is missing role {role_name}"))
+        })?;
+        *status = CooperativeRoleStatus::Completed(outputs);
+        self.materialize_ready_roles(job_id)?;
+        Ok(())
+    }
+
+    fn mark_cooperative_role_uncertain(&mut self, task_id: TaskId) {
+        let Some((job_id, role_name)) = self.task_roles.get(&task_id).cloned() else {
+            return;
+        };
+        if let Some(job) = self.jobs.get_mut(&job_id) {
+            if let Some(status) = job.roles.get_mut(&role_name) {
+                *status = CooperativeRoleStatus::Uncertain;
+            }
+        }
+    }
+
+    fn materialize_ready_roles(&mut self, job_id: JobId) -> Result<(), FabricError> {
+        let ready = {
+            let job = self
+                .jobs
+                .get(&job_id)
+                .ok_or(FabricError::UnknownJob(job_id))?;
+            job.spec
+                .roles
+                .iter()
+                .filter(|role| job.roles.get(&role.name) == Some(&CooperativeRoleStatus::Waiting))
+                .filter_map(|role| {
+                    let mut dependency_inputs = Vec::new();
+                    for dependency in &role.depends_on {
+                        match job.roles.get(dependency) {
+                            Some(CooperativeRoleStatus::Completed(outputs)) => {
+                                dependency_inputs.extend(outputs.iter().copied());
+                            }
+                            _ => return None,
+                        }
+                    }
+                    Some((role.name.clone(), role.task.instantiate(dependency_inputs)))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (role_name, task) in ready {
+            let task_id = task.id;
+            self.submit(task)?;
+            self.task_roles.insert(task_id, (job_id, role_name.clone()));
+            self.jobs
+                .get_mut(&job_id)
+                .expect("cooperative job existence checked above")
+                .roles
+                .insert(role_name, CooperativeRoleStatus::Submitted(task_id));
+        }
+        Ok(())
     }
 
     pub fn active_resource_count(&self) -> usize {
@@ -425,6 +620,90 @@ fn same_object_identity(left: &ObjectMetadata, right: &ObjectMetadata) -> bool {
         && left.producer == right.producer
 }
 
+fn validate_cooperative_job(job: &CooperativeJobSpec) -> Result<(), FabricError> {
+    if job.roles.is_empty() {
+        return Err(FabricError::InvalidCooperativeJob(
+            "at least one role is required".into(),
+        ));
+    }
+    if job.outputs.is_empty() {
+        return Err(FabricError::InvalidCooperativeJob(
+            "at least one output role is required".into(),
+        ));
+    }
+
+    let mut names = HashSet::with_capacity(job.roles.len());
+    for role in &job.roles {
+        if role.name.trim().is_empty() {
+            return Err(FabricError::InvalidCooperativeJob(
+                "role names cannot be empty".into(),
+            ));
+        }
+        if !names.insert(role.name.as_str()) {
+            return Err(FabricError::InvalidCooperativeJob(format!(
+                "duplicate role {}",
+                role.name
+            )));
+        }
+    }
+
+    for role in &job.roles {
+        let mut dependencies = HashSet::with_capacity(role.depends_on.len());
+        for dependency in &role.depends_on {
+            if !names.contains(dependency.as_str()) {
+                return Err(FabricError::InvalidCooperativeJob(format!(
+                    "role {} depends on unknown role {dependency}",
+                    role.name
+                )));
+            }
+            if !dependencies.insert(dependency.as_str()) {
+                return Err(FabricError::InvalidCooperativeJob(format!(
+                    "role {} lists dependency {dependency} more than once",
+                    role.name
+                )));
+            }
+        }
+    }
+    let mut outputs = HashSet::with_capacity(job.outputs.len());
+    for output in &job.outputs {
+        if !names.contains(output.as_str()) {
+            return Err(FabricError::InvalidCooperativeJob(format!(
+                "unknown output role {output}"
+            )));
+        }
+        if !outputs.insert(output.as_str()) {
+            return Err(FabricError::InvalidCooperativeJob(format!(
+                "output role {output} is listed more than once"
+            )));
+        }
+    }
+
+    let mut resolved = HashSet::with_capacity(job.roles.len());
+    loop {
+        let before = resolved.len();
+        for role in &job.roles {
+            if resolved.contains(role.name.as_str()) {
+                continue;
+            }
+            if role
+                .depends_on
+                .iter()
+                .all(|dependency| resolved.contains(dependency.as_str()))
+            {
+                resolved.insert(role.name.as_str());
+            }
+        }
+        if resolved.len() == job.roles.len() {
+            return Ok(());
+        }
+        if resolved.len() == before {
+            return Err(FabricError::InvalidCooperativeJob(
+                "role dependency graph contains a cycle".into(),
+            ));
+        }
+    }
+}
+
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -439,7 +718,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use plurifold_core::{
-        Architecture, CostHint, EffectSemantics, ObjectMetadata, ResourceRequirements, TaskSpec,
+        Architecture, CooperativeJobSpec, CooperativeRoleSpec, CostHint, EffectSemantics,
+        ObjectMetadata, ResourceRequirements, TaskSpec, TaskTemplate,
     };
 
     use super::*;
@@ -473,6 +753,18 @@ mod tests {
         }
     }
 
+    fn task_template(effects: EffectSemantics) -> TaskTemplate {
+        TaskTemplate {
+            artifact: "test".into(),
+            entrypoint: "run".into(),
+            arguments: vec![],
+            inputs: vec![],
+            requirements: ResourceRequirements::default(),
+            effects,
+            cost: CostHint::default(),
+        }
+    }
+
     #[test]
     fn resources_hot_join_and_leave_without_global_reconfiguration() {
         let mut fabric = Fabric::default();
@@ -483,6 +775,28 @@ mod tests {
         assert_eq!(fabric.active_resource_count(), 2);
         fabric.unregister_resource(first);
         assert_eq!(fabric.active_resource_count(), 1);
+    }
+
+    #[test]
+    fn scheduler_spreads_work_away_from_busy_resources() {
+        let mut fabric = Fabric::new(10_000, 10_000);
+        let fast = ResourceId::new();
+        let slow = ResourceId::new();
+        let mut fast_resource = resource(fast);
+        fast_resource.performance_score = 10.0;
+        fabric.register_resource(fast_resource);
+        fabric.register_resource(resource(slow));
+
+        let first = task(EffectSemantics::Pure);
+        let first_id = first.id;
+        fabric.submit(first).unwrap();
+        assert_eq!(fabric.schedule_task(first_id).unwrap().resource_id, fast);
+        fabric.begin_execution(first_id, fast).unwrap();
+
+        let second = task(EffectSemantics::Pure);
+        let second_id = second.id;
+        fabric.submit(second).unwrap();
+        assert_eq!(fabric.schedule_task(second_id).unwrap().resource_id, slow);
     }
 
     #[test]
@@ -620,5 +934,150 @@ mod tests {
             vec![survivor]
         );
         assert!(fabric.topology.links.is_empty());
+    }
+
+    #[test]
+    fn cooperative_job_runs_independent_roles_before_join_role() {
+        let mut fabric = Fabric::new(10_000, 10_000);
+        let worker = ResourceId::new();
+        fabric.register_resource(resource(worker));
+        let job_id = JobId::new();
+        fabric
+            .submit_cooperative(CooperativeJobSpec {
+                id: job_id,
+                roles: vec![
+                    CooperativeRoleSpec {
+                        name: "left".into(),
+                        task: task_template(EffectSemantics::Pure),
+                        depends_on: vec![],
+                    },
+                    CooperativeRoleSpec {
+                        name: "right".into(),
+                        task: task_template(EffectSemantics::Pure),
+                        depends_on: vec![],
+                    },
+                    CooperativeRoleSpec {
+                        name: "join".into(),
+                        task: task_template(EffectSemantics::Pure),
+                        depends_on: vec!["left".into(), "right".into()],
+                    },
+                ],
+                outputs: vec!["join".into()],
+            })
+            .unwrap();
+
+        let roots = fabric.pending_task_ids();
+        assert_eq!(roots.len(), 2);
+        let views = fabric.cooperative_role_views(job_id).unwrap();
+        assert!(views
+            .iter()
+            .any(|role| { role.name == "join" && role.status == CooperativeRoleStatus::Waiting }));
+
+        let first = roots[0];
+        let first_lease = fabric.begin_execution(first, worker).unwrap();
+        let first_output = ObjectMetadata {
+            id: ObjectId::new(),
+            size_bytes: 1,
+            digest: Some("sha256:first".into()),
+            encoding: None,
+            locations: vec![worker],
+            producer: Some(first),
+        };
+        fabric
+            .complete_execution(&first_lease, vec![first_output])
+            .unwrap();
+        assert_eq!(fabric.pending_task_ids().len(), 1);
+
+        let second = roots[1];
+        let second_lease = fabric.begin_execution(second, worker).unwrap();
+        let second_output = ObjectMetadata {
+            id: ObjectId::new(),
+            size_bytes: 1,
+            digest: Some("sha256:second".into()),
+            encoding: None,
+            locations: vec![worker],
+            producer: Some(second),
+        };
+        fabric
+            .complete_execution(&second_lease, vec![second_output])
+            .unwrap();
+
+        let pending = fabric.pending_task_ids();
+        assert_eq!(pending.len(), 1);
+        let join = fabric.task_spec(pending[0]).unwrap();
+        assert_eq!(join.inputs.len(), 2);
+        let join_id = join.id;
+        assert!(matches!(
+            fabric.cooperative_job_status(job_id),
+            Some(CooperativeJobStatus::Running)
+        ));
+
+        let join_lease = fabric.begin_execution(join_id, worker).unwrap();
+        let final_output = ObjectMetadata {
+            id: ObjectId::new(),
+            size_bytes: 2,
+            digest: Some("sha256:joined".into()),
+            encoding: None,
+            locations: vec![worker],
+            producer: Some(join_id),
+        };
+        let final_id = final_output.id;
+        fabric
+            .complete_execution(&join_lease, vec![final_output])
+            .unwrap();
+        assert_eq!(
+            fabric.cooperative_job_status(job_id),
+            Some(CooperativeJobStatus::Completed(vec![final_id]))
+        );
+    }
+
+    #[test]
+    fn cooperative_job_rejects_dependency_cycles() {
+        let mut fabric = Fabric::default();
+        let error = fabric
+            .submit_cooperative(CooperativeJobSpec {
+                id: JobId::new(),
+                roles: vec![
+                    CooperativeRoleSpec {
+                        name: "a".into(),
+                        task: task_template(EffectSemantics::Pure),
+                        depends_on: vec!["b".into()],
+                    },
+                    CooperativeRoleSpec {
+                        name: "b".into(),
+                        task: task_template(EffectSemantics::Pure),
+                        depends_on: vec!["a".into()],
+                    },
+                ],
+                outputs: vec!["b".into()],
+            })
+            .unwrap_err();
+        assert!(matches!(error, FabricError::InvalidCooperativeJob(_)));
+    }
+
+    #[test]
+    fn exclusive_role_uncertainty_propagates_to_cooperative_job() {
+        let mut fabric = Fabric::new(10_000, 0);
+        let worker = ResourceId::new();
+        fabric.register_resource(resource(worker));
+        let job_id = JobId::new();
+        fabric
+            .submit_cooperative(CooperativeJobSpec {
+                id: job_id,
+                roles: vec![CooperativeRoleSpec {
+                    name: "side-effect".into(),
+                    task: task_template(EffectSemantics::Exclusive),
+                    depends_on: vec![],
+                }],
+                outputs: vec!["side-effect".into()],
+            })
+            .unwrap();
+        let task_id = fabric.pending_task_ids()[0];
+        let lease = fabric.begin_execution(task_id, worker).unwrap();
+        fabric.reap_expired_executions_at(lease.expires_at_unix_ms);
+        assert_eq!(
+            fabric.cooperative_job_status(job_id),
+            Some(CooperativeJobStatus::Uncertain)
+        );
     }
 }

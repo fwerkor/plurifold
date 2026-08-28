@@ -28,7 +28,20 @@
 - [ ] benchmark-driven resource performance models
 - [ ] real routed multi-host validation (the current development containers do not expose a mutually reachable address)
 
-## Phase 2 — Topology and graph adaptation
+## Phase 2 — Cooperative execution
+
+- [x] logical Cooperative Job above one-resource Task executions
+- [x] named roles with per-role capability/resource requirements
+- [x] concurrent scheduling of dependency-free roles
+- [x] dependency-driven downstream task materialization
+- [x] predecessor output Objects wired into dependent roles
+- [x] logical job output aggregation and uncertainty propagation
+- [x] multi-process E2E with two simultaneous role executions and a cross-resource join
+- [ ] dynamic role insertion while a job is running
+- [ ] automatic decomposition/planning from higher-level computation graphs
+- [ ] elastic role replication and quorum/reduction policies
+
+## Phase 3 — Topology and graph adaptation
 
 - [ ] active RTT/bandwidth probing
 - [ ] peer link graph maintenance and latency domains from live measurements
@@ -37,7 +50,7 @@
 - [ ] checkpoint-aware migration
 - [ ] policy simulator and trace replay
 
-## Phase 3 — Heterogeneous accelerators
+## Phase 4 — Heterogeneous accelerators
 
 - [ ] CUDA executor adapter
 - [ ] ROCm executor adapter
@@ -45,14 +58,14 @@
 - [ ] multi-implementation task selection
 - [ ] site-local collective groups
 
-## Phase 4 — Stateful primitives
+## Phase 5 — Stateful primitives
 
 - [ ] Actor checkpoints and rebinding
 - [ ] Streams with backpressure
 - [ ] explicit Collectives constrained to latency domains
 - [ ] decentralized/federated coordinator research
 
-## Phase 5 — Evaluation
+## Phase 6 — Evaluation
 
 - [ ] WAN emulation and real multi-site deployment
 - [ ] failure injection at scale

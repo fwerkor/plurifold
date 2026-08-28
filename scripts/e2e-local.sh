@@ -72,6 +72,7 @@ wait_http "$COORD/healthz"
 ./target/debug/plurifold-agent run \
   --name worker-a \
   --performance 2 \
+  --feature demo:role-left \
   --coordinator "$COORD" \
   --bind "127.0.0.1:${A_PORT}" \
   --advertise "$A_URL" \
@@ -85,6 +86,7 @@ PIDS+=("$A_PID")
 ./target/debug/plurifold-agent run \
   --name worker-b \
   --performance 1 \
+  --feature demo:role-right \
   --coordinator "$COORD" \
   --bind "127.0.0.1:${B_PORT}" \
   --advertise "$B_URL" \
@@ -133,6 +135,115 @@ BLOB_COUNT=$(find "$TMP/b/sha256" -type f | wc -l)
 [[ "$BLOB_COUNT" -ge 3 ]]
 
 echo "peer-transfer: ok (worker-b cached $BLOB_COUNT blobs)"
+
+cat >"$TMP/cooperative-job.json" <<'JSON'
+{
+  "roles": [
+    {
+      "name": "left",
+      "task": {
+        "artifact": "builtin:sleep",
+        "entrypoint": "run",
+        "arguments": ["3000"],
+        "requirements": {
+          "architecture": null,
+          "min_memory_bytes": 0,
+          "accelerator": null,
+          "required_features": ["demo:role-left"]
+        },
+        "effects": "Pure",
+        "cost": {"compute_ms_on_reference": 3000.0, "output_bytes": 4}
+      },
+      "depends_on": []
+    },
+    {
+      "name": "right",
+      "task": {
+        "artifact": "builtin:sleep",
+        "entrypoint": "run",
+        "arguments": ["3000"],
+        "requirements": {
+          "architecture": null,
+          "min_memory_bytes": 0,
+          "accelerator": null,
+          "required_features": ["demo:role-right"]
+        },
+        "effects": "Pure",
+        "cost": {"compute_ms_on_reference": 3000.0, "output_bytes": 4}
+      },
+      "depends_on": []
+    },
+    {
+      "name": "join",
+      "task": {
+        "artifact": "builtin:concat",
+        "entrypoint": "run",
+        "requirements": {
+          "architecture": null,
+          "min_memory_bytes": 0,
+          "accelerator": null,
+          "required_features": ["demo:role-left"]
+        },
+        "effects": "Pure",
+        "cost": {"compute_ms_on_reference": 100.0, "output_bytes": 8}
+      },
+      "depends_on": ["left", "right"]
+    }
+  ],
+  "outputs": ["join"]
+}
+JSON
+
+COOPERATIVE_JOB=$(./target/debug/plurifold job submit \
+  --coordinator "$COORD" \
+  --file "$TMP/cooperative-job.json")
+
+LEFT_TASK=""
+RIGHT_TASK=""
+for _ in $(seq 1 100); do
+  JOB_VIEW=$(./target/debug/plurifold job status --coordinator "$COORD" --job "$COOPERATIVE_JOB")
+  LEFT_TASK=$(printf '%s' "$JOB_VIEW" | python3 -c 'import json,sys
+name=sys.argv[1]
+for role in json.load(sys.stdin)["roles"]:
+    if role["name"] == name and isinstance(role["status"], dict) and "Submitted" in role["status"]:
+        print(role["status"]["Submitted"])
+        break' left)
+  RIGHT_TASK=$(printf '%s' "$JOB_VIEW" | python3 -c 'import json,sys
+name=sys.argv[1]
+for role in json.load(sys.stdin)["roles"]:
+    if role["name"] == name and isinstance(role["status"], dict) and "Submitted" in role["status"]:
+        print(role["status"]["Submitted"])
+        break' right)
+  if [[ -n "$LEFT_TASK" && -n "$RIGHT_TASK" ]]; then
+    break
+  fi
+  sleep 0.05
+done
+[[ -n "$LEFT_TASK" && -n "$RIGHT_TASK" ]]
+
+LEFT_RESOURCE=""
+RIGHT_RESOURCE=""
+for _ in $(seq 1 100); do
+  LEFT_VIEW=$(./target/debug/plurifold status --coordinator "$COORD" --task "$LEFT_TASK")
+  RIGHT_VIEW=$(./target/debug/plurifold status --coordinator "$COORD" --task "$RIGHT_TASK")
+  LEFT_RESOURCE=$(printf '%s' "$LEFT_VIEW" | json_running_resource)
+  RIGHT_RESOURCE=$(printf '%s' "$RIGHT_VIEW" | json_running_resource)
+  if [[ -n "$LEFT_RESOURCE" && -n "$RIGHT_RESOURCE" ]]; then
+    break
+  fi
+  sleep 0.05
+done
+[[ "$LEFT_RESOURCE" == "$A_ID" ]]
+[[ "$RIGHT_RESOURCE" == "$B_ID" ]]
+
+./target/debug/plurifold job wait \
+  --coordinator "$COORD" \
+  --job "$COOPERATIVE_JOB" \
+  --timeout-s 12 >/dev/null
+
+COOPERATIVE_EXPECTED=$(printf 'donedone' | sha256sum | awk '{print $1}')
+[[ -f "$TMP/a/sha256/$COOPERATIVE_EXPECTED" ]]
+echo "cooperative-job: ok (left=$LEFT_RESOURCE, right=$RIGHT_RESOURCE, joined on worker-a)"
 
 FAILURE_TASK=$(./target/debug/plurifold submit \
   --coordinator "$COORD" \

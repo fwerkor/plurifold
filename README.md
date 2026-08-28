@@ -16,7 +16,8 @@ The research hypothesis is that useful global scheduling requires more than plac
 
 ## Core abstractions
 
-- **Task** — a schedulable computation with declared inputs, outputs, requirements, retry semantics, arguments, and cost hints.
+- **Cooperative Job** — one logical objective decomposed into dependency-linked roles that may run concurrently on complementary resources.
+- **Task** — one schedulable execution unit with declared inputs, requirements, retry semantics, arguments, and cost hints.
 - **Object** — immutable/versioned data identified independently of its current physical location.
 - **Resource** — a leased description of compute, memory, accelerators, runtimes, network position, and reliability.
 - **Actor** — a logical stateful service whose state can be checkpointed and rebound to another resource (planned after the task/object core).
@@ -28,7 +29,7 @@ The research hypothesis is that useful global scheduling requires more than plac
 ```text
 Applications / libraries
         |
-Programming model: Task / Object / Actor / Stream / Collective
+Programming model: Cooperative Job / Task / Object / Actor / Stream / Collective
         |
 Dynamic graph runtime
   dependencies | retry | fusion | batching | checkpoint
@@ -46,19 +47,20 @@ Resource fabric
 
 ## Repository status
 
-The repository now contains a **v0.2 networked research prototype**, not only a design scaffold:
+The repository now contains a **v0.3 networked research prototype**, not only a design scaffold:
 
 - typed Resource, Task, Object, Topology, membership-lease, and execution-lease models;
 - a topology-aware placement cost model;
 - a real HTTP/JSON coordinator control plane;
 - hot-pluggable agents with membership heartbeats and epoch-based reincarnation safety;
 - renewable work leases for long-running tasks;
+- cooperative jobs whose independent roles can execute concurrently on different resources and whose dependent roles consume predecessor outputs;
 - a SHA-256 content-addressed local object cache;
 - direct agent-to-agent HTTP object transfer with digest verification and replica registration;
 - replay-safe retry after worker loss, with non-replay-safe tasks entering `Uncertain`;
 - a small builtin executor (`identity`, `concat`, `echo`, `sleep`) used to exercise the runtime without hiding unimplemented portability behind a fake generic executor;
-- a CLI for object publication, task submission/status, resource inspection, and topology links;
-- a multi-process E2E test that kills a worker during execution and verifies takeover by the survivor.
+- a CLI for object publication, task and cooperative-job submission/status, resource inspection, and topology links;
+- a multi-process E2E test that verifies direct peer transfer, two-resource cooperative execution with a join role, and takeover after worker loss.
 
 Still intentionally missing: authentication/TLS, durable coordinator state, active RTT/bandwidth probing, native/WASI sandboxed executors, accelerator adapters, graph rewriting, and production-grade observability.
 
@@ -89,6 +91,16 @@ cargo run -p plurifold-agent -- run \
 ```
 
 The defaults bind to loopback. The current control plane is unauthenticated, so do not expose it to an untrusted network.
+
+Cooperative jobs are submitted as JSON role graphs:
+
+```bash
+cargo run -p plurifold-cli -- job submit \
+  --coordinator http://127.0.0.1:8080 \
+  --file examples/cooperative-job.json
+```
+
+Roles without dependencies become schedulable together. A dependent role is materialized only after all predecessors finish, and their output Object IDs are appended to its inputs.
 
 ## Design invariants
 

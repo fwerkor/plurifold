@@ -1,0 +1,62 @@
+{
+  "roles": [
+    {
+      "name": "left",
+      "task": {
+        "artifact": "builtin:sleep",
+        "entrypoint": "run",
+        "arguments": ["500"],
+        "requirements": {
+          "architecture": null,
+          "min_memory_bytes": 0,
+          "accelerator": null,
+          "required_features": []
+        },
+        "effects": "Pure",
+        "cost": {
+          "compute_ms_on_reference": 500.0,
+          "output_bytes": 4
+        }
+      }
+    },
+    {
+      "name": "right",
+      "task": {
+        "artifact": "builtin:sleep",
+        "entrypoint": "run",
+        "arguments": ["500"],
+        "requirements": {
+          "architecture": null,
+          "min_memory_bytes": 0,
+          "accelerator": null,
+          "required_features": []
+        },
+        "effects": "Pure",
+        "cost": {
+          "compute_ms_on_reference": 500.0,
+          "output_bytes": 4
+        }
+      }
+    },
+    {
+      "name": "join",
+      "task": {
+        "artifact": "builtin:concat",
+        "entrypoint": "run",
+        "requirements": {
+          "architecture": null,
+          "min_memory_bytes": 0,
+          "accelerator": null,
+          "required_features": []
+        },
+        "effects": "Pure",
+        "cost": {
+          "compute_ms_on_reference": 10.0,
+          "output_bytes": 8
+        }
+      },
+      "depends_on": ["left", "right"]
+    }
+  ],
+  "outputs": ["join"]
+}

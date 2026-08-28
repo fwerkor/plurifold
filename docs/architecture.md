@@ -14,11 +14,18 @@ Applications express computations through stable logical handles. Domain librari
 
 ### Programming model
 
-The base model is a dynamic dataflow graph:
+The base execution model is a dynamic dataflow graph:
 
 `Task(inputs: Object...) -> Object...`
 
-Task and Object are the minimal portable units. Actor, Stream, and Collective are explicit extensions because they have different failure and placement semantics.
+Task and Object are the minimal portable execution units. A Cooperative Job adds a logical objective above them: it names multiple role Tasks, allows independent roles to run concurrently on complementary resources, and releases dependent roles when predecessor Objects become available. Actor, Stream, and Collective remain explicit extensions because they have different failure and placement semantics.
+
+```text
+Cooperative Job
+   ├─ role A -> Task -> Object(s)
+   ├─ role B -> Task -> Object(s)
+   └─ role C depends on A,B -> Task -> result Object(s)
+```
 
 ### Graph runtime
 
@@ -52,6 +59,8 @@ This design avoids requiring a single globally mounted filesystem and makes line
 Resources register a descriptor and receive a membership lease. Heartbeats renew it. A missing heartbeat removes the resource from future placement without globally stopping other resources.
 
 Task execution also uses leases. A coordinator may reschedule expired work if and only if retry semantics allow it. Late results carry an execution attempt identity and are rejected or deduplicated deterministically.
+
+Cooperative roles do not share one giant execution lease. Each materialized role remains an ordinary Task with an independent lease and placement decision. This lets one logical job survive partial worker loss without imposing a global barrier on unrelated roles.
 
 ### Executors
 

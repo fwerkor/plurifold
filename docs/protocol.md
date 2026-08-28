@@ -1,6 +1,6 @@
 # Protocol
 
-Plurifold v0.2 uses a deliberately small **HTTP/JSON control plane**. The Rust request/response types in `plurifold-protocol` are authoritative for the current prototype. `proto/plurifold.proto` remains a transport-neutral design sketch for a possible future binary RPC encoding; it is not generated into the build.
+Plurifold v0.3 uses a deliberately small **HTTP/JSON control plane**. The Rust request/response types in `plurifold-protocol` are authoritative for the current prototype. `proto/plurifold.proto` remains a transport-neutral design sketch for a possible future binary RPC encoding; it is not generated into the build.
 
 ## Membership
 
@@ -28,11 +28,17 @@ Completion uses `POST /v1/work/complete`. The coordinator accepts the outputs on
 
 If a lease expires, replay-safe work returns to `Pending`. An `Exclusive` task instead becomes `Uncertain` and requires application/operator reconciliation.
 
+## Cooperative jobs
+
+`POST /v1/jobs` submits a `CooperativeJobSpec`. Root roles are immediately materialized as ordinary Tasks. When a role completes, the coordinator records its output Object IDs and materializes any roles whose dependencies are now satisfied. Those downstream Tasks use predecessor outputs as normal object inputs, so cross-resource edges reuse the same replica discovery and direct peer-transfer path as standalone Tasks.
+
+`GET /v1/jobs/{id}` returns the logical job status plus each role's state. A job completes after all roles complete; its result is the concatenated output Object IDs of the roles named in `job.outputs`. An unreplayable role entering `Uncertain` propagates that state to the whole job.
+
 ## Object metadata and data plane
 
 Object metadata is published to `POST /v1/objects/publish`. When an agent fetches an existing object into its local cache, it records the new physical replica through `POST /v1/objects/replica`.
 
-Bulk bytes do **not** pass through the coordinator. In v0.2 each agent exposes:
+Bulk bytes do **not** pass through the coordinator. In v0.3 each agent exposes:
 
 - `POST /v1/objects` — stage bytes into the local SHA-256 CAS and create logical object metadata;
 - `GET /v1/blobs/{sha256}` — serve immutable bytes directly to another agent.
@@ -58,10 +64,12 @@ The prototype accepts measured links at `POST /v1/topology/link`. Links carry RT
 | `POST /v1/objects/replica` | add cached replica location |
 | `POST /v1/tasks` | submit task |
 | `GET /v1/tasks/{id}` | inspect task state |
+| `POST /v1/jobs` | submit cooperative role graph |
+| `GET /v1/jobs/{id}` | inspect cooperative job and role states |
 | `POST /v1/topology/link` | update measured link |
 
 ## Compatibility and security
 
 Resource capabilities and task features use extensible string identifiers where premature closed enums would block new accelerator/runtime types. Wire-version negotiation and backward compatibility are not implemented yet.
 
-The v0.2 service is **unauthenticated** and defaults to loopback. Cross-trust-domain authentication, authorization, TLS, signed artifacts, and secret locality are design requirements in `security.md`, not claims of the current implementation.
+The v0.3 service is **unauthenticated** and defaults to loopback. Cross-trust-domain authentication, authorization, TLS, signed artifacts, and secret locality are design requirements in `security.md`, not claims of the current implementation.

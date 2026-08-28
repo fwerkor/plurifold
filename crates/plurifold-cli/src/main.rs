@@ -4,14 +4,16 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use plurifold_core::{
-    Architecture, CostHint, EffectSemantics, LinkProfile, ObjectId, ObjectMetadata,
-    ResourceDescriptor, ResourceId, ResourceRequirements, TaskId, TaskSpec, TopologySnapshot,
+    Architecture, CooperativeJobSpec, CostHint, EffectSemantics, JobId, LinkProfile, ObjectId,
+    ObjectMetadata, ResourceDescriptor, ResourceId, ResourceRequirements, TaskId, TaskSpec,
+    TopologySnapshot,
 };
 use plurifold_protocol::{
-    ErrorResponse, LinkUpdateRequest, PublishObjectRequest, PutObjectResponse,
-    ResourceListResponse, SubmitTaskRequest, SubmitTaskResponse, TaskView,
+    CooperativeJobView, ErrorResponse, LinkUpdateRequest, PublishObjectRequest, PutObjectResponse,
+    ResourceListResponse, SubmitCooperativeJobRequest, SubmitCooperativeJobResponse,
+    SubmitTaskRequest, SubmitTaskResponse, TaskView,
 };
-use plurifold_runtime::{Fabric, TaskStatus};
+use plurifold_runtime::{CooperativeJobStatus, Fabric, TaskStatus};
 use reqwest::Client;
 
 #[derive(Parser)]
@@ -69,6 +71,11 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         timeout_s: u64,
     },
+    /// Submit, inspect, and wait for multi-role cooperative jobs.
+    Job {
+        #[command(subcommand)]
+        command: JobCommand,
+    },
     /// List active resources and their advertised data endpoints.
     Resources {
         #[arg(long)]
@@ -86,6 +93,33 @@ enum Command {
         rtt_ms: f64,
         #[arg(long)]
         bandwidth_mbps: f64,
+    },
+}
+
+#[derive(Subcommand)]
+enum JobCommand {
+    /// Submit a cooperative job definition from JSON.
+    Submit {
+        #[arg(long)]
+        coordinator: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Query a cooperative job and all role states.
+    Status {
+        #[arg(long)]
+        coordinator: String,
+        #[arg(long)]
+        job: JobId,
+    },
+    /// Wait until a cooperative job completes or becomes uncertain.
+    Wait {
+        #[arg(long)]
+        coordinator: String,
+        #[arg(long)]
+        job: JobId,
+        #[arg(long, default_value_t = 30)]
+        timeout_s: u64,
     },
 }
 
@@ -139,6 +173,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             task,
             timeout_s,
         } => wait(&Client::new(), &coordinator, task, timeout_s).await?,
+        Command::Job { command } => match command {
+            JobCommand::Submit { coordinator, file } => {
+                let bytes = tokio::fs::read(file).await?;
+                let job: CooperativeJobSpec = serde_json::from_slice(&bytes)?;
+                submit_job(&Client::new(), &coordinator, job).await?;
+            }
+            JobCommand::Status { coordinator, job } => {
+                let view = cooperative_job_view(&Client::new(), &coordinator, job).await?;
+                println!("{}", serde_json::to_string_pretty(&view)?);
+            }
+            JobCommand::Wait {
+                coordinator,
+                job,
+                timeout_s,
+            } => wait_job(&Client::new(), &coordinator, job, timeout_s).await?,
+        },
         Command::Resources { coordinator } => {
             let response = checked(
                 Client::new()
@@ -240,6 +290,39 @@ async fn task_view(
     Ok(response.json().await?)
 }
 
+async fn submit_job(
+    client: &Client,
+    coordinator: &str,
+    job: CooperativeJobSpec,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let response = checked(
+        client
+            .post(format!("{}/v1/jobs", base(coordinator)))
+            .json(&SubmitCooperativeJobRequest { job })
+            .send()
+            .await?,
+    )
+    .await?;
+    let submitted: SubmitCooperativeJobResponse = response.json().await?;
+    println!("{}", submitted.job_id);
+    Ok(())
+}
+
+async fn cooperative_job_view(
+    client: &Client,
+    coordinator: &str,
+    job: JobId,
+) -> Result<CooperativeJobView, Box<dyn std::error::Error>> {
+    let response = checked(
+        client
+            .get(format!("{}/v1/jobs/{job}", base(coordinator)))
+            .send()
+            .await?,
+    )
+    .await?;
+    Ok(response.json().await?)
+}
+
 async fn wait(
     client: &Client,
     coordinator: &str,
@@ -261,6 +344,32 @@ async fn wait(
         }
         if Instant::now() >= deadline {
             return Err(format!("timed out waiting for task {task}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_job(
+    client: &Client,
+    coordinator: &str,
+    job: JobId,
+    timeout_s: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_s);
+    loop {
+        let view = cooperative_job_view(client, coordinator, job).await?;
+        match view.status {
+            CooperativeJobStatus::Completed(_) => {
+                println!("{}", serde_json::to_string_pretty(&view)?);
+                return Ok(());
+            }
+            CooperativeJobStatus::Uncertain => {
+                return Err(format!("cooperative job {job} entered uncertain state").into());
+            }
+            CooperativeJobStatus::Running => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("timed out waiting for cooperative job {job}").into());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

@@ -8,12 +8,13 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use plurifold_core::{ObjectId, ResourceId, TaskId};
+use plurifold_core::{JobId, ObjectId, ResourceId, TaskId};
 use plurifold_protocol::{
-    CompleteExecutionRequest, ErrorResponse, HeartbeatRequest, LinkUpdateRequest, ObjectReplica,
-    PublishObjectRequest, RegisterReplicaRequest, RegisterResourceRequest,
-    RegisterResourceResponse, RenewExecutionRequest, ResolvedObject, ResourceListResponse,
-    ResourceView, SubmitTaskRequest, SubmitTaskResponse, TaskView, WorkAssignment, WorkPollRequest,
+    CompleteExecutionRequest, CooperativeJobView, ErrorResponse, HeartbeatRequest,
+    LinkUpdateRequest, ObjectReplica, PublishObjectRequest, RegisterReplicaRequest,
+    RegisterResourceRequest, RegisterResourceResponse, RenewExecutionRequest, ResolvedObject,
+    ResourceListResponse, ResourceView, SubmitCooperativeJobRequest, SubmitCooperativeJobResponse,
+    SubmitTaskRequest, SubmitTaskResponse, TaskView, WorkAssignment, WorkPollRequest,
     WorkPollResponse,
 };
 use plurifold_runtime::{Fabric, FabricError};
@@ -52,6 +53,8 @@ impl Coordinator {
             .route("/v1/objects/replica", post(register_replica))
             .route("/v1/tasks", post(submit_task))
             .route("/v1/tasks/{task_id}", get(get_task))
+            .route("/v1/jobs", post(submit_cooperative_job))
+            .route("/v1/jobs/{job_id}", get(get_cooperative_job))
             .route("/v1/topology/link", post(update_link))
             .with_state(self)
     }
@@ -280,6 +283,41 @@ async fn get_task(
     Ok(Json(TaskView { task, status }))
 }
 
+async fn submit_cooperative_job(
+    State(coordinator): State<Coordinator>,
+    Json(request): Json<SubmitCooperativeJobRequest>,
+) -> Result<Json<SubmitCooperativeJobResponse>, ApiError> {
+    let mut state = coordinator.inner.lock().await;
+    let job_id = state
+        .fabric
+        .submit_cooperative(request.job)
+        .map_err(ApiError::from_fabric)?;
+    Ok(Json(SubmitCooperativeJobResponse { job_id }))
+}
+
+async fn get_cooperative_job(
+    State(coordinator): State<Coordinator>,
+    Path(job_id): Path<String>,
+) -> Result<Json<CooperativeJobView>, ApiError> {
+    let job_id = JobId::from_str(&job_id)
+        .map_err(|_| ApiError::bad_request("job_id is not a valid UUID"))?;
+    let state = coordinator.inner.lock().await;
+    let job = state
+        .fabric
+        .cooperative_job_spec(job_id)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("cooperative job not found"))?;
+    let status = state
+        .fabric
+        .cooperative_job_status(job_id)
+        .ok_or_else(|| ApiError::not_found("cooperative job not found"))?;
+    let roles = state
+        .fabric
+        .cooperative_role_views(job_id)
+        .ok_or_else(|| ApiError::not_found("cooperative job not found"))?;
+    Ok(Json(CooperativeJobView { job, status, roles }))
+}
+
 async fn update_link(
     State(coordinator): State<Coordinator>,
     Json(request): Json<LinkUpdateRequest>,
@@ -343,14 +381,17 @@ impl ApiError {
     fn from_fabric(error: FabricError) -> Self {
         let status = match error {
             FabricError::UnknownTask(_)
+            | FabricError::UnknownJob(_)
             | FabricError::UnknownObject(_)
             | FabricError::ResourceNotActive(_) => StatusCode::NOT_FOUND,
             FabricError::DuplicateTask(_)
+            | FabricError::DuplicateJob(_)
             | FabricError::ObjectConflict(_)
             | FabricError::TaskNotPending(_)
             | FabricError::StaleExecution
             | FabricError::ExecutionExpired
             | FabricError::StaleResourceEpoch(_) => StatusCode::CONFLICT,
+            FabricError::InvalidCooperativeJob(_) => StatusCode::BAD_REQUEST,
             FabricError::Scheduling(_) => StatusCode::UNPROCESSABLE_ENTITY,
         };
         Self {

@@ -40,6 +40,7 @@ macro_rules! opaque_id {
 }
 
 opaque_id!(TaskId);
+opaque_id!(JobId);
 opaque_id!(ObjectId);
 opaque_id!(ResourceId);
 opaque_id!(ExecutionId);
@@ -172,6 +173,53 @@ pub struct TaskSpec {
     pub requirements: ResourceRequirements,
     pub effects: EffectSemantics,
     pub cost: CostHint,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskTemplate {
+    pub artifact: String,
+    pub entrypoint: String,
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    #[serde(default)]
+    pub inputs: Vec<ObjectId>,
+    pub requirements: ResourceRequirements,
+    pub effects: EffectSemantics,
+    pub cost: CostHint,
+}
+
+impl TaskTemplate {
+    pub fn instantiate(&self, dependency_inputs: impl IntoIterator<Item = ObjectId>) -> TaskSpec {
+        let mut inputs = self.inputs.clone();
+        inputs.extend(dependency_inputs);
+        TaskSpec {
+            id: TaskId::new(),
+            artifact: self.artifact.clone(),
+            entrypoint: self.entrypoint.clone(),
+            arguments: self.arguments.clone(),
+            inputs,
+            requirements: self.requirements.clone(),
+            effects: self.effects.clone(),
+            cost: self.cost.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CooperativeRoleSpec {
+    pub name: String,
+    pub task: TaskTemplate,
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CooperativeJobSpec {
+    #[serde(default)]
+    pub id: JobId,
+    pub roles: Vec<CooperativeRoleSpec>,
+    /// Outputs from these terminal roles form the logical job result.
+    pub outputs: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -1,8 +1,8 @@
 use plurifold_core::{
-    ExecutionLease, LinkProfile, MembershipLease, ObjectId, ObjectMetadata, ResourceDescriptor,
-    ResourceId, TaskId, TaskSpec,
+    CooperativeJobSpec, ExecutionLease, JobId, LinkProfile, MembershipLease, ObjectId,
+    ObjectMetadata, ResourceDescriptor, ResourceId, TaskId, TaskSpec,
 };
-use plurifold_runtime::TaskStatus;
+use plurifold_runtime::{CooperativeJobStatus, CooperativeRoleView, TaskStatus};
 use serde::{Deserialize, Serialize};
 
 pub const API_VERSION: u32 = 1;
@@ -84,6 +84,23 @@ pub struct SubmitTaskRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SubmitTaskResponse {
     pub task_id: TaskId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubmitCooperativeJobRequest {
+    pub job: CooperativeJobSpec,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubmitCooperativeJobResponse {
+    pub job_id: JobId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CooperativeJobView {
+    pub job: CooperativeJobSpec,
+    pub status: CooperativeJobStatus,
+    pub roles: Vec<CooperativeRoleView>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
