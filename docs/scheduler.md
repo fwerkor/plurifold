@@ -42,11 +42,13 @@ Hard compatibility should never be represented only as a large score.
 
 ## Adaptive graph granularity
 
-Placement alone is insufficient on WANs. Plurifold therefore treats graph rewriting as a first-class future mechanism.
+Placement alone is insufficient on WANs. Plurifold therefore treats graph granularity as a scheduler/runtime concern rather than a fixed application constant.
 
-For producer `A` and consumer `B`, if their intermediate object is large relative to the compute between WAN crossings, it may be better to fuse them into one placement unit. Conversely, compute-heavy independent work may be split and replicated.
+v0.7 wires the existing `FusionAdvisor` into logical-job materialization for one conservative case: a Pure producer with a single Pure consumer. The runtime looks ahead before submitting the producer, estimates separate producer/consumer paths using the normal placement model, identifies the best cross-resource path, and evaluates the intermediate's transfer time from the measured `LinkProfile`.
 
-The initial `FusionAdvisor` uses a simple threshold based on intermediate bytes, RTT, and bandwidth. The research path is to replace this with measured/learned cost models while preserving deterministic semantics.
+If the cross-resource edge exceeds the advisor threshold and a same-resource `TaskPipeline` is no worse than the best separate modeled path, the runtime may choose the pipeline. Exact cost ties prefer the coarser execution because it removes an intermediate Task/Object boundary; Plurifold does not invent an unmeasured fixed CAS/control-plane savings constant. Status therefore distinguishes `estimated_avoided_transfer_ms` from `estimated_vs_separate_ms`.
+
+The initial `FusionAdvisor` still uses a simple threshold based on intermediate bytes, RTT, and bandwidth. General N-stage fusion, batching, splitting, and replication remain research work; the path is to replace the heuristic with benchmark-driven or learned transformation costs while preserving application-visible semantics.
 
 ## Non-regression property for elastic resources
 

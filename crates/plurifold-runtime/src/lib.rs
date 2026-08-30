@@ -6,7 +6,9 @@ use plurifold_core::{
     MembershipLease, ObjectId, ObjectMetadata, ResourceDescriptor, ResourceId, TaskId, TaskSpec,
     TopologySnapshot,
 };
-use plurifold_scheduler::{PlacementDecision, ScheduleError, TopologyAwareScheduler};
+use plurifold_scheduler::{
+    FusionAdvisor, PlacementDecision, ScheduleError, TopologyAwareScheduler,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -48,6 +50,14 @@ pub struct CooperativeRoleView {
     pub implementation: Option<String>,
     pub planned_resource: Option<ResourceId>,
     pub estimated_total_ms: Option<f64>,
+    pub fusion: Option<RoleFusionView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoleFusionView {
+    pub peer_role: String,
+    pub estimated_avoided_transfer_ms: f64,
+    pub estimated_vs_separate_ms: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +84,20 @@ struct RoleSelection {
     implementation: String,
     planned_resource: ResourceId,
     estimated_total_ms: f64,
+    fusion: Option<RoleFusionView>,
+}
+
+#[derive(Clone, Debug)]
+enum TaskRoleBinding {
+    Single {
+        job_id: JobId,
+        role_name: String,
+    },
+    FusedPair {
+        job_id: JobId,
+        producer_role: String,
+        consumer_role: String,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -90,6 +114,8 @@ pub enum FabricError {
     ObjectConflict(ObjectId),
     #[error("task {0} already exists")]
     DuplicateTask(TaskId),
+    #[error("invalid task: {0}")]
+    InvalidTask(String),
     #[error("cooperative job {0} does not exist")]
     UnknownJob(JobId),
     #[error("cooperative job {0} already exists")]
@@ -114,7 +140,7 @@ pub struct Fabric {
     objects: HashMap<ObjectId, ObjectMetadata>,
     tasks: HashMap<TaskId, TaskRecord>,
     jobs: HashMap<JobId, CooperativeJobRecord>,
-    task_roles: HashMap<TaskId, (JobId, String)>,
+    task_roles: HashMap<TaskId, TaskRoleBinding>,
     topology: TopologySnapshot,
     scheduler: TopologyAwareScheduler,
     membership_ttl_ms: u64,
@@ -269,6 +295,7 @@ impl Fabric {
     }
 
     pub fn submit(&mut self, task: TaskSpec) -> Result<TaskId, FabricError> {
+        validate_task(&task)?;
         let id = task.id;
         if self.tasks.contains_key(&id) {
             return Err(FabricError::DuplicateTask(id));
@@ -387,6 +414,10 @@ impl Fabric {
                         .selections
                         .get(&name)
                         .map(|selection| selection.estimated_total_ms),
+                    fusion: record
+                        .selections
+                        .get(&name)
+                        .and_then(|selection| selection.fusion.clone()),
                     name,
                     depends_on,
                 })
@@ -600,28 +631,76 @@ impl Fabric {
         task_id: TaskId,
         outputs: Vec<ObjectId>,
     ) -> Result<(), FabricError> {
-        let Some((job_id, role_name)) = self.task_roles.get(&task_id).cloned() else {
+        let Some(binding) = self.task_roles.get(&task_id).cloned() else {
             return Ok(());
         };
-        let job = self
-            .jobs
-            .get_mut(&job_id)
-            .ok_or(FabricError::UnknownJob(job_id))?;
-        let status = job.roles.get_mut(&role_name).ok_or_else(|| {
-            FabricError::InvalidCooperativeJob(format!("runtime state is missing role {role_name}"))
-        })?;
-        *status = CooperativeRoleStatus::Completed(outputs);
+        let job_id = match binding {
+            TaskRoleBinding::Single { job_id, role_name } => {
+                let job = self
+                    .jobs
+                    .get_mut(&job_id)
+                    .ok_or(FabricError::UnknownJob(job_id))?;
+                let status = job.roles.get_mut(&role_name).ok_or_else(|| {
+                    FabricError::InvalidCooperativeJob(format!(
+                        "runtime state is missing role {role_name}"
+                    ))
+                })?;
+                *status = CooperativeRoleStatus::Completed(outputs);
+                job_id
+            }
+            TaskRoleBinding::FusedPair {
+                job_id,
+                producer_role,
+                consumer_role,
+            } => {
+                let job = self
+                    .jobs
+                    .get_mut(&job_id)
+                    .ok_or(FabricError::UnknownJob(job_id))?;
+                let producer = job.roles.get_mut(&producer_role).ok_or_else(|| {
+                    FabricError::InvalidLogicalJob(format!(
+                        "runtime state is missing fused producer role {producer_role}"
+                    ))
+                })?;
+                *producer = CooperativeRoleStatus::Completed(Vec::new());
+                let consumer = job.roles.get_mut(&consumer_role).ok_or_else(|| {
+                    FabricError::InvalidLogicalJob(format!(
+                        "runtime state is missing fused consumer role {consumer_role}"
+                    ))
+                })?;
+                *consumer = CooperativeRoleStatus::Completed(outputs);
+                job_id
+            }
+        };
         self.materialize_ready_roles(job_id)?;
         Ok(())
     }
 
     fn mark_cooperative_role_uncertain(&mut self, task_id: TaskId) {
-        let Some((job_id, role_name)) = self.task_roles.get(&task_id).cloned() else {
+        let Some(binding) = self.task_roles.get(&task_id).cloned() else {
             return;
         };
-        if let Some(job) = self.jobs.get_mut(&job_id) {
-            if let Some(status) = job.roles.get_mut(&role_name) {
-                *status = CooperativeRoleStatus::Uncertain;
+        match binding {
+            TaskRoleBinding::Single { job_id, role_name } => {
+                if let Some(job) = self.jobs.get_mut(&job_id) {
+                    if let Some(status) = job.roles.get_mut(&role_name) {
+                        *status = CooperativeRoleStatus::Uncertain;
+                    }
+                }
+            }
+            TaskRoleBinding::FusedPair {
+                job_id,
+                producer_role,
+                consumer_role,
+            } => {
+                if let Some(job) = self.jobs.get_mut(&job_id) {
+                    if let Some(status) = job.roles.get_mut(&producer_role) {
+                        *status = CooperativeRoleStatus::Uncertain;
+                    }
+                    if let Some(status) = job.roles.get_mut(&consumer_role) {
+                        *status = CooperativeRoleStatus::Uncertain;
+                    }
+                }
             }
         }
     }
@@ -644,6 +723,7 @@ impl Fabric {
                 name: String,
                 role: plurifold_core::LogicalRoleSpec,
                 dependency_inputs: Vec<ObjectId>,
+                fusion_consumer: Option<plurifold_core::LogicalRoleSpec>,
             },
         }
 
@@ -683,6 +763,7 @@ impl Fabric {
                                 name: role.name.clone(),
                                 role: role.clone(),
                                 dependency_inputs: inputs,
+                                fusion_consumer: fusion_successor(spec, &job.roles, role),
                             }
                         })
                     })
@@ -697,8 +778,73 @@ impl Fabric {
                     name,
                     role,
                     dependency_inputs,
+                    fusion_consumer,
                 } => {
                     let resources = self.schedulable_resources();
+                    if let Some(consumer) = fusion_consumer {
+                        if let Some(selected) = planner::select_ready_fusion(
+                            &role,
+                            &dependency_inputs,
+                            &consumer,
+                            &planner::FusionContext {
+                                scheduler: &self.scheduler,
+                                advisor: &FusionAdvisor::default(),
+                                resources: &resources,
+                                objects: &self.objects,
+                                topology: &self.topology,
+                            },
+                        ) {
+                            let task_id = selected.task.id;
+                            self.submit(selected.task)?;
+                            self.task_roles.insert(
+                                task_id,
+                                TaskRoleBinding::FusedPair {
+                                    job_id,
+                                    producer_role: name.clone(),
+                                    consumer_role: consumer.name.clone(),
+                                },
+                            );
+                            let job = self
+                                .jobs
+                                .get_mut(&job_id)
+                                .expect("logical job existence checked above");
+                            job.roles
+                                .insert(name.clone(), CooperativeRoleStatus::Submitted(task_id));
+                            job.roles.insert(
+                                consumer.name.clone(),
+                                CooperativeRoleStatus::Submitted(task_id),
+                            );
+                            job.selections.insert(
+                                name.clone(),
+                                RoleSelection {
+                                    implementation: selected.producer_implementation,
+                                    planned_resource: selected.resource_id,
+                                    estimated_total_ms: selected.cost.total_ms,
+                                    fusion: Some(RoleFusionView {
+                                        peer_role: consumer.name.clone(),
+                                        estimated_avoided_transfer_ms: selected
+                                            .estimated_avoided_transfer_ms,
+                                        estimated_vs_separate_ms: selected.estimated_vs_separate_ms,
+                                    }),
+                                },
+                            );
+                            job.selections.insert(
+                                consumer.name.clone(),
+                                RoleSelection {
+                                    implementation: selected.consumer_implementation,
+                                    planned_resource: selected.resource_id,
+                                    estimated_total_ms: selected.cost.total_ms,
+                                    fusion: Some(RoleFusionView {
+                                        peer_role: name,
+                                        estimated_avoided_transfer_ms: selected
+                                            .estimated_avoided_transfer_ms,
+                                        estimated_vs_separate_ms: selected.estimated_vs_separate_ms,
+                                    }),
+                                },
+                            );
+                            continue;
+                        }
+                    }
                     let Some(selected) = planner::select_ready_role(
                         &role,
                         &dependency_inputs,
@@ -718,6 +864,7 @@ impl Fabric {
                         implementation: selected.implementation,
                         planned_resource: selected.resource_id,
                         estimated_total_ms: selected.cost.total_ms,
+                        fusion: None,
                     };
                     (name, selected.task, Some(selection))
                 }
@@ -725,7 +872,13 @@ impl Fabric {
 
             let task_id = task.id;
             self.submit(task)?;
-            self.task_roles.insert(task_id, (job_id, role_name.clone()));
+            self.task_roles.insert(
+                task_id,
+                TaskRoleBinding::Single {
+                    job_id,
+                    role_name: role_name.clone(),
+                },
+            );
             let job = self
                 .jobs
                 .get_mut(&job_id)
@@ -792,6 +945,30 @@ fn job_roles(definition: &JobDefinition) -> Vec<(String, Vec<String>)> {
     }
 }
 
+fn fusion_successor(
+    spec: &LogicalJobSpec,
+    statuses: &HashMap<String, CooperativeRoleStatus>,
+    producer: &plurifold_core::LogicalRoleSpec,
+) -> Option<plurifold_core::LogicalRoleSpec> {
+    if spec.outputs.contains(&producer.name) {
+        return None;
+    }
+    let mut consumers = spec.roles.iter().filter(|candidate| {
+        candidate
+            .depends_on
+            .iter()
+            .any(|dependency| dependency == &producer.name)
+    });
+    let consumer = consumers.next()?;
+    if consumers.next().is_some()
+        || consumer.depends_on.as_slice() != [producer.name.as_str()]
+        || statuses.get(&consumer.name) != Some(&CooperativeRoleStatus::Waiting)
+    {
+        return None;
+    }
+    Some(consumer.clone())
+}
+
 fn dependency_outputs(
     statuses: &HashMap<String, CooperativeRoleStatus>,
     dependencies: &[String],
@@ -814,6 +991,61 @@ fn same_object_identity(left: &ObjectMetadata, right: &ObjectMetadata) -> bool {
         && left.digest == right.digest
         && left.encoding == right.encoding
         && left.producer == right.producer
+}
+
+fn validate_task(task: &TaskSpec) -> Result<(), FabricError> {
+    let Some(pipeline) = &task.pipeline else {
+        return Ok(());
+    };
+    if task.artifact != "plurifold:pipeline" || task.entrypoint != "run" {
+        return Err(FabricError::InvalidTask(
+            "pipeline tasks require artifact plurifold:pipeline and entrypoint run".into(),
+        ));
+    }
+    if task.effects != plurifold_core::EffectSemantics::Pure {
+        return Err(FabricError::InvalidTask(
+            "pipeline tasks currently require Pure effect semantics".into(),
+        ));
+    }
+    if pipeline.stages.len() < 2 {
+        return Err(FabricError::InvalidTask(
+            "pipeline tasks require at least two stages".into(),
+        ));
+    }
+    for (stage_index, stage) in pipeline.stages.iter().enumerate() {
+        if !stage.artifact.starts_with("builtin:") {
+            return Err(FabricError::InvalidTask(format!(
+                "pipeline stage {stage_index} uses unsupported artifact family {}",
+                stage.artifact
+            )));
+        }
+        if stage.entrypoint != "run" {
+            return Err(FabricError::InvalidTask(format!(
+                "pipeline stage {stage_index} requires entrypoint run"
+            )));
+        }
+        let previous_count = stage
+            .inputs
+            .iter()
+            .filter(|input| matches!(input, plurifold_core::PipelineInput::PreviousOutput))
+            .count();
+        if (stage_index == 0 && previous_count != 0) || (stage_index > 0 && previous_count != 1) {
+            return Err(FabricError::InvalidTask(format!(
+                "pipeline stage {stage_index} has invalid previous-output bindings"
+            )));
+        }
+        for input in &stage.inputs {
+            if let plurifold_core::PipelineInput::External { index } = input {
+                if *index >= task.inputs.len() {
+                    return Err(FabricError::InvalidTask(format!(
+                        "pipeline stage {stage_index} references external input index {index}, but the task has {} inputs",
+                        task.inputs.len()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_cooperative_job(job: &CooperativeJobSpec) -> Result<(), FabricError> {
@@ -841,8 +1073,8 @@ mod tests {
 
     use plurifold_core::{
         Architecture, CooperativeJobSpec, CooperativeRoleSpec, CostHint, EffectSemantics,
-        LogicalJobSpec, LogicalRoleSpec, ObjectMetadata, ResourceRequirements, RoleImplementation,
-        TaskSpec, TaskTemplate,
+        LinkProfile, LogicalJobSpec, LogicalRoleSpec, ObjectMetadata, ResourceRequirements,
+        RoleImplementation, TaskSpec, TaskTemplate,
     };
 
     use super::*;
@@ -873,6 +1105,7 @@ mod tests {
             requirements: ResourceRequirements::default(),
             effects,
             cost: CostHint::default(),
+            pipeline: None,
         }
     }
 
@@ -914,6 +1147,83 @@ mod tests {
         }
     }
 
+    fn fusion_resource(
+        id: ResourceId,
+        performance_score: f64,
+        startup_delay_ms: f64,
+        features: &[&str],
+    ) -> ResourceDescriptor {
+        ResourceDescriptor {
+            id,
+            epoch: 0,
+            architecture: Architecture::X86_64,
+            cpu_cores: 8,
+            memory_bytes: 16 << 30,
+            accelerators: vec![],
+            features: features
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect(),
+            performance_score,
+            queue_delay_ms: 0.0,
+            startup_delay_ms,
+            failure_probability: 0.0,
+        }
+    }
+
+    fn fusion_job() -> LogicalJobSpec {
+        LogicalJobSpec {
+            id: JobId::new(),
+            roles: vec![
+                LogicalRoleSpec {
+                    name: "producer".into(),
+                    implementations: vec![RoleImplementation {
+                        name: "producer-builtin".into(),
+                        task: TaskTemplate {
+                            artifact: "builtin:echo".into(),
+                            entrypoint: "run".into(),
+                            arguments: vec!["intermediate".into()],
+                            inputs: vec![],
+                            requirements: ResourceRequirements {
+                                required_features: BTreeSet::from(["fusion:producer".into()]),
+                                ..ResourceRequirements::default()
+                            },
+                            effects: EffectSemantics::Pure,
+                            cost: CostHint {
+                                compute_ms_on_reference: 100.0,
+                                output_bytes: 106_250,
+                            },
+                        },
+                    }],
+                    depends_on: vec![],
+                },
+                LogicalRoleSpec {
+                    name: "consumer".into(),
+                    implementations: vec![RoleImplementation {
+                        name: "consumer-builtin".into(),
+                        task: TaskTemplate {
+                            artifact: "builtin:identity".into(),
+                            entrypoint: "run".into(),
+                            arguments: vec![],
+                            inputs: vec![],
+                            requirements: ResourceRequirements {
+                                required_features: BTreeSet::from(["fusion:consumer".into()]),
+                                ..ResourceRequirements::default()
+                            },
+                            effects: EffectSemantics::Pure,
+                            cost: CostHint {
+                                compute_ms_on_reference: 1_000.0,
+                                output_bytes: 12,
+                            },
+                        },
+                    }],
+                    depends_on: vec!["producer".into()],
+                },
+            ],
+            outputs: vec!["consumer".into()],
+        }
+    }
+
     #[test]
     fn resources_hot_join_and_leave_without_global_reconfiguration() {
         let mut fabric = Fabric::default();
@@ -924,6 +1234,180 @@ mod tests {
         assert_eq!(fabric.active_resource_count(), 2);
         fabric.unregister_resource(first);
         assert_eq!(fabric.active_resource_count(), 1);
+    }
+
+    #[test]
+    fn malformed_pipeline_is_rejected_at_submission() {
+        let mut fabric = Fabric::default();
+        let mut pipeline_task = task(EffectSemantics::Pure);
+        pipeline_task.artifact = "plurifold:pipeline".into();
+        pipeline_task.pipeline = Some(plurifold_core::TaskPipeline {
+            stages: vec![
+                plurifold_core::TaskPipelineStage {
+                    artifact: "builtin:identity".into(),
+                    entrypoint: "run".into(),
+                    arguments: vec![],
+                    inputs: vec![plurifold_core::PipelineInput::External { index: 0 }],
+                },
+                plurifold_core::TaskPipelineStage {
+                    artifact: "builtin:identity".into(),
+                    entrypoint: "run".into(),
+                    arguments: vec![],
+                    inputs: vec![plurifold_core::PipelineInput::PreviousOutput],
+                },
+            ],
+        });
+
+        let error = fabric.submit(pipeline_task).unwrap_err();
+        assert!(matches!(error, FabricError::InvalidTask(_)));
+    }
+
+    #[test]
+    fn high_transfer_cost_fuses_a_linear_logical_pair() {
+        let mut fabric = Fabric::default();
+        let local = ResourceId::new();
+        let remote = ResourceId::new();
+        fabric.register_resource(fusion_resource(
+            local,
+            1.0,
+            500.0,
+            &["fusion:producer", "fusion:consumer"],
+        ));
+        fabric.register_resource(fusion_resource(remote, 10.0, 0.0, &["fusion:consumer"]));
+        fabric.upsert_link(LinkProfile {
+            from: local,
+            to: remote,
+            rtt_ms: 100.0,
+            bandwidth_mbps: 1.0,
+        });
+
+        let job_id = fabric.submit_logical(fusion_job()).unwrap();
+        let views = fabric.cooperative_role_views(job_id).unwrap();
+        let producer = views.iter().find(|role| role.name == "producer").unwrap();
+        let consumer = views.iter().find(|role| role.name == "consumer").unwrap();
+        let producer_task = match producer.status {
+            CooperativeRoleStatus::Submitted(task_id) => task_id,
+            ref status => panic!("producer was not submitted: {status:?}"),
+        };
+        let consumer_task = match consumer.status {
+            CooperativeRoleStatus::Submitted(task_id) => task_id,
+            ref status => panic!("consumer was not submitted: {status:?}"),
+        };
+        assert_eq!(producer_task, consumer_task);
+        assert_eq!(producer.planned_resource, Some(local));
+        assert_eq!(consumer.planned_resource, Some(local));
+        assert_eq!(producer.fusion.as_ref().unwrap().peer_role, "consumer");
+        assert!(
+            producer
+                .fusion
+                .as_ref()
+                .unwrap()
+                .estimated_avoided_transfer_ms
+                > 20.0
+        );
+        assert!(producer.fusion.as_ref().unwrap().estimated_vs_separate_ms >= 0.0);
+        assert!(fabric.task_spec(producer_task).unwrap().pipeline.is_some());
+
+        let lease = fabric.begin_execution(producer_task, local).unwrap();
+        let output = ObjectId::new();
+        fabric
+            .complete_execution(
+                &lease,
+                vec![ObjectMetadata {
+                    id: output,
+                    size_bytes: 12,
+                    digest: Some("sha256:test".into()),
+                    encoding: Some("application/octet-stream".into()),
+                    locations: vec![local],
+                    producer: Some(producer_task),
+                }],
+            )
+            .unwrap();
+        let completed = fabric.cooperative_role_views(job_id).unwrap();
+        let producer = completed
+            .iter()
+            .find(|role| role.name == "producer")
+            .unwrap();
+        let consumer = completed
+            .iter()
+            .find(|role| role.name == "consumer")
+            .unwrap();
+        assert_eq!(producer.status, CooperativeRoleStatus::Completed(vec![]));
+        assert_eq!(
+            consumer.status,
+            CooperativeRoleStatus::Completed(vec![output])
+        );
+        assert_eq!(
+            fabric.cooperative_job_status(job_id),
+            Some(CooperativeJobStatus::Completed(vec![output]))
+        );
+    }
+
+    #[test]
+    fn fast_link_keeps_a_linear_logical_pair_separate() {
+        let mut fabric = Fabric::default();
+        let local = ResourceId::new();
+        let remote = ResourceId::new();
+        fabric.register_resource(fusion_resource(
+            local,
+            1.0,
+            500.0,
+            &["fusion:producer", "fusion:consumer"],
+        ));
+        fabric.register_resource(fusion_resource(remote, 10.0, 0.0, &["fusion:consumer"]));
+        fabric.upsert_link(LinkProfile {
+            from: local,
+            to: remote,
+            rtt_ms: 1.0,
+            bandwidth_mbps: 10_000.0,
+        });
+
+        let job_id = fabric.submit_logical(fusion_job()).unwrap();
+        let views = fabric.cooperative_role_views(job_id).unwrap();
+        let producer = views.iter().find(|role| role.name == "producer").unwrap();
+        let consumer = views.iter().find(|role| role.name == "consumer").unwrap();
+        let producer_task = match producer.status {
+            CooperativeRoleStatus::Submitted(task_id) => task_id,
+            ref status => panic!("producer was not submitted: {status:?}"),
+        };
+        assert_eq!(consumer.status, CooperativeRoleStatus::Waiting);
+        assert!(producer.fusion.is_none());
+        assert!(fabric.task_spec(producer_task).unwrap().pipeline.is_none());
+    }
+
+    #[test]
+    fn branching_producer_is_not_fusion_eligible() {
+        let producer = LogicalRoleSpec {
+            name: "producer".into(),
+            implementations: vec![logical_implementation("producer", "p", 1.0, 10)],
+            depends_on: vec![],
+        };
+        let first_consumer = LogicalRoleSpec {
+            name: "first".into(),
+            implementations: vec![logical_implementation("first", "c", 1.0, 1)],
+            depends_on: vec!["producer".into()],
+        };
+        let second_consumer = LogicalRoleSpec {
+            name: "second".into(),
+            implementations: vec![logical_implementation("second", "c", 1.0, 1)],
+            depends_on: vec!["producer".into()],
+        };
+        let spec = LogicalJobSpec {
+            id: JobId::new(),
+            roles: vec![
+                producer.clone(),
+                first_consumer.clone(),
+                second_consumer.clone(),
+            ],
+            outputs: vec!["first".into(), "second".into()],
+        };
+        let statuses = HashMap::from([
+            ("producer".into(), CooperativeRoleStatus::Waiting),
+            ("first".into(), CooperativeRoleStatus::Waiting),
+            ("second".into(), CooperativeRoleStatus::Waiting),
+        ]);
+
+        assert!(fusion_successor(&spec, &statuses, &producer).is_none());
     }
 
     #[test]

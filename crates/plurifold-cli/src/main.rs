@@ -175,6 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         compute_ms_on_reference: compute_ms,
                         output_bytes,
                     },
+                    pipeline: None,
                 },
             )
             .await?;
@@ -491,6 +492,7 @@ fn demo() {
             compute_ms_on_reference: 5_000.0,
             output_bytes: 1 << 20,
         },
+        pipeline: None,
     };
     let task_id = fabric.submit(task).unwrap();
     let decision = fabric.schedule_task(task_id).unwrap();

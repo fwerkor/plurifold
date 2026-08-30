@@ -1,6 +1,6 @@
 # Protocol
 
-Plurifold v0.6 uses a deliberately small **HTTP/JSON control plane** (protocol constant `API_VERSION = 2`). The Rust request/response types in `plurifold-protocol` are authoritative for the current prototype. `proto/plurifold.proto` remains a transport-neutral design sketch for a possible future binary RPC encoding; it is not generated into the build.
+Plurifold v0.7 uses a deliberately small **HTTP/JSON control plane** (protocol constant `API_VERSION = 3`). The Rust request/response types in `plurifold-protocol` are authoritative for the current prototype. `proto/plurifold.proto` remains a transport-neutral design sketch for a possible future binary RPC encoding; it is not generated into the build.
 
 ## Membership
 
@@ -28,11 +28,13 @@ Completion uses `POST /v1/work/complete`. The coordinator accepts the outputs on
 
 If a lease expires, replay-safe work returns to `Pending`. An `Exclusive` task instead becomes `Uncertain` and requires application/operator reconciliation.
 
+`TaskSpec` now has an optional runtime-generated `pipeline`. A `TaskPipeline` is an ordered list of stages. Stage inputs explicitly bind either to an external Task input index or to the immediately previous stage output. Ordinary submitted Tasks leave this field absent. The v0.7 agent uses it for fused builtin-family work: all external Objects are materialized once, stage intermediates remain in memory, and only the final bytes are committed as the Task output.
+
 ## Cooperative jobs
 
 `POST /v1/jobs` submits a `CooperativeJobSpec`. Root roles are immediately materialized as ordinary Tasks. When a role completes, the coordinator records its output Object IDs and materializes any roles whose dependencies are now satisfied. Those downstream Tasks use predecessor outputs as normal object inputs, so cross-resource edges reuse the same replica discovery and direct peer-transfer path as standalone Tasks.
 
-`GET /v1/jobs/{id}` returns either the fixed `CooperativeJobSpec` or live `LogicalJobSpec`, plus each role's state. Dynamically selected roles also report the chosen implementation, advisory resource, and ready-time estimated cost. A job completes after all roles complete; its result is the concatenated output Object IDs of the roles named in the job definition. An unreplayable role entering `Uncertain` propagates that state to the whole job.
+`GET /v1/jobs/{id}` returns either the fixed `CooperativeJobSpec` or live `LogicalJobSpec`, plus each role's state. Dynamically selected roles also report the chosen implementation, advisory resource, ready-time estimated cost, and optional fusion metadata. Fusion metadata names the peer role and includes `estimated_avoided_transfer_ms` plus `estimated_vs_separate_ms`. A job completes after all roles complete; its result is the concatenated output Object IDs of the roles named in the job definition. An unreplayable role entering `Uncertain` propagates that state to the whole job.
 
 ## Logical planning
 
@@ -40,11 +42,13 @@ If a lease expires, replay-safe work returns to `Pending`. An `Exclusive` task i
 
 `POST /v1/jobs/auto` accepts the same `LogicalJobSpec` but stores the logical definition rather than freezing the preview. Its response includes the Job ID and an optional `initial_plan`; the preview is absent when the current snapshot has no complete feasible plan, but the logical job can still be accepted. Each role is implementation-selected when its real dependencies complete. If no implementation is feasible then, the role remains `Ready`; later agent polling retries it against current membership, topology, and Object replicas. This is what allows a hot-joined resource to change a downstream implementation choice after submission.
 
+Before a currently ready logical producer is materialized, v0.7 may look ahead to a sole dependent consumer and submit one fused `TaskPipeline` instead. This is an execution-time transformation, not part of the `job plan` snapshot contract. Both role views then reference the same Task ID. The producer is not allowed to be a declared job output or have another consumer, so suppressing its intermediate Object does not remove an application-visible result.
+
 ## Object metadata and data plane
 
 Object metadata is published to `POST /v1/objects/publish`. When an agent fetches an existing object into its local cache, it records the new physical replica through `POST /v1/objects/replica`.
 
-Bulk object bytes do **not** pass through the coordinator. In v0.6 each agent exposes:
+Bulk object bytes do **not** pass through the coordinator. In v0.7 each agent exposes:
 
 - `POST /v1/objects` — stage bytes into the local SHA-256 CAS and create logical object metadata;
 - `GET /v1/blobs/{sha256}` — serve immutable bytes directly to another agent.
@@ -84,4 +88,4 @@ Agents periodically reuse `GET /v1/resources` to discover peer data endpoints. O
 
 Resource capabilities and task features use extensible string identifiers where premature closed enums would block new accelerator/runtime types. Wire-version negotiation and backward compatibility are not implemented yet.
 
-The v0.6 service is **unauthenticated** and defaults to loopback. Cross-trust-domain authentication, authorization, TLS, signed artifacts, and secret locality are design requirements in `security.md`, not claims of the current implementation.
+The v0.7 service is **unauthenticated** and defaults to loopback. Cross-trust-domain authentication, authorization, TLS, signed artifacts, and secret locality are design requirements in `security.md`, not claims of the current implementation.

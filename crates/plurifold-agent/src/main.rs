@@ -13,7 +13,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::{Parser, Subcommand};
 use plurifold_core::{
-    Architecture, MembershipLease, ObjectId, ObjectMetadata, ResourceDescriptor, ResourceId,
+    Architecture, MembershipLease, ObjectId, ObjectMetadata, PipelineInput, ResourceDescriptor,
+    ResourceId, TaskPipeline, TaskSpec,
 };
 use plurifold_protocol::{
     CompleteExecutionRequest, ErrorResponse, HeartbeatRequest, LinkMeasurement, PutObjectResponse,
@@ -420,7 +421,7 @@ async fn execute_and_commit(
                 .push(materialize_input(client, coordinator, store, resource_id, input).await?);
         }
 
-        let output_bytes = execute_builtin(&assignment, &input_bytes).await?;
+        let output_bytes = execute_task(&assignment.task, &input_bytes).await?;
         let stored = store
             .put(&output_bytes)
             .map_err(|error| error.to_string())?;
@@ -545,21 +546,57 @@ async fn materialize_input(
     Err(last_error)
 }
 
-async fn execute_builtin(
-    assignment: &WorkAssignment,
+async fn execute_task(task: &TaskSpec, inputs: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+    match &task.pipeline {
+        Some(pipeline) => execute_pipeline(pipeline, inputs).await,
+        None => execute_builtin_operation(&task.artifact, &task.arguments, inputs).await,
+    }
+}
+
+async fn execute_pipeline(pipeline: &TaskPipeline, inputs: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+    if pipeline.stages.len() < 2 {
+        return Err("task pipeline requires at least two stages".to_owned());
+    }
+
+    let mut previous: Option<Vec<u8>> = None;
+    for (stage_index, stage) in pipeline.stages.iter().enumerate() {
+        let mut stage_inputs = Vec::with_capacity(stage.inputs.len());
+        for binding in &stage.inputs {
+            match binding {
+                PipelineInput::External { index } => stage_inputs.push(
+                    inputs
+                        .get(*index)
+                        .cloned()
+                        .ok_or_else(|| format!("pipeline input index {index} is out of range"))?,
+                ),
+                PipelineInput::PreviousOutput => {
+                    stage_inputs.push(previous.clone().ok_or_else(|| {
+                        format!("pipeline stage {stage_index} references a missing previous output")
+                    })?)
+                }
+            }
+        }
+        previous = Some(
+            execute_builtin_operation(&stage.artifact, &stage.arguments, &stage_inputs).await?,
+        );
+    }
+    previous.ok_or_else(|| "task pipeline produced no output".to_owned())
+}
+
+async fn execute_builtin_operation(
+    artifact: &str,
+    arguments: &[String],
     inputs: &[Vec<u8>],
 ) -> Result<Vec<u8>, String> {
-    match assignment.task.artifact.as_str() {
+    match artifact {
         "builtin:identity" => inputs
             .first()
             .cloned()
             .ok_or_else(|| "builtin:identity requires one input".to_owned()),
         "builtin:concat" => Ok(inputs.iter().flatten().copied().collect()),
-        "builtin:echo" => Ok(assignment.task.arguments.join(" ").into_bytes()),
+        "builtin:echo" => Ok(arguments.join(" ").into_bytes()),
         "builtin:sleep" => {
-            let millis = assignment
-                .task
-                .arguments
+            let millis = arguments
                 .first()
                 .ok_or_else(|| {
                     "builtin:sleep requires milliseconds as its first argument".to_owned()
@@ -716,5 +753,52 @@ fn current_architecture() -> Architecture {
         "aarch64" => Architecture::Aarch64,
         "riscv64" => Architecture::RiscV64,
         other => Architecture::Other(other.to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use plurifold_core::{
+        CostHint, EffectSemantics, ResourceRequirements, TaskId, TaskPipelineStage,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn pipeline_keeps_intermediate_output_in_memory() {
+        let task = TaskSpec {
+            id: TaskId::new(),
+            artifact: "plurifold:pipeline".into(),
+            entrypoint: "run".into(),
+            arguments: vec![],
+            inputs: vec![],
+            requirements: ResourceRequirements::default(),
+            effects: EffectSemantics::Pure,
+            cost: CostHint::default(),
+            pipeline: Some(TaskPipeline {
+                stages: vec![
+                    TaskPipelineStage {
+                        artifact: "builtin:identity".into(),
+                        entrypoint: "run".into(),
+                        arguments: vec![],
+                        inputs: vec![PipelineInput::External { index: 0 }],
+                    },
+                    TaskPipelineStage {
+                        artifact: "builtin:concat".into(),
+                        entrypoint: "run".into(),
+                        arguments: vec![],
+                        inputs: vec![
+                            PipelineInput::PreviousOutput,
+                            PipelineInput::External { index: 1 },
+                        ],
+                    },
+                ],
+            }),
+        };
+
+        let output = execute_task(&task, &[b"left".to_vec(), b"right".to_vec()])
+            .await
+            .unwrap();
+        assert_eq!(output, b"leftright");
     }
 }

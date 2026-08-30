@@ -504,9 +504,9 @@ impl ApiError {
             | FabricError::StaleExecution
             | FabricError::ExecutionExpired
             | FabricError::StaleResourceEpoch(_) => StatusCode::CONFLICT,
-            FabricError::InvalidCooperativeJob(_) | FabricError::InvalidLogicalJob(_) => {
-                StatusCode::BAD_REQUEST
-            }
+            FabricError::InvalidTask(_)
+            | FabricError::InvalidCooperativeJob(_)
+            | FabricError::InvalidLogicalJob(_) => StatusCode::BAD_REQUEST,
             FabricError::Scheduling(_) => StatusCode::UNPROCESSABLE_ENTITY,
         };
         Self {

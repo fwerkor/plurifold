@@ -70,6 +70,57 @@ for role in json.load(sys.stdin)["roles"]:
         break' "$name"
 }
 
+write_fusion_job() {
+  local file=$1
+  local output_bytes=$2
+  cat >"$file" <<JSON
+{
+  "roles": [
+    {
+      "name": "producer",
+      "implementations": [{
+        "name": "producer-builtin",
+        "task": {
+          "artifact": "builtin:sleep",
+          "entrypoint": "run",
+          "arguments": ["600"],
+          "requirements": {
+            "architecture": null,
+            "min_memory_bytes": 0,
+            "accelerator": null,
+            "required_features": ["fusion:producer"]
+          },
+          "effects": "Pure",
+          "cost": {"compute_ms_on_reference": 100.0, "output_bytes": $output_bytes}
+        }
+      }],
+      "depends_on": []
+    },
+    {
+      "name": "consumer",
+      "implementations": [{
+        "name": "consumer-builtin",
+        "task": {
+          "artifact": "builtin:identity",
+          "entrypoint": "run",
+          "requirements": {
+            "architecture": null,
+            "min_memory_bytes": 0,
+            "accelerator": null,
+            "required_features": ["fusion:consumer"]
+          },
+          "effects": "Pure",
+          "cost": {"compute_ms_on_reference": 1000.0, "output_bytes": 4}
+        }
+      }],
+      "depends_on": ["producer"]
+    }
+  ],
+  "outputs": ["consumer"]
+}
+JSON
+}
+
 cargo build --workspace --quiet
 
 ./target/debug/plurifold-coordinator \
@@ -86,6 +137,8 @@ wait_http "$COORD/healthz"
   --name worker-a \
   --performance 2 \
   --feature demo:role-left \
+  --feature fusion:producer \
+  --feature fusion:consumer \
   --coordinator "$COORD" \
   --bind "127.0.0.1:${A_PORT}" \
   --advertise "$A_URL" \
@@ -432,6 +485,7 @@ done
   --name worker-c \
   --performance 20 \
   --feature demo:join-fast \
+  --feature fusion:consumer \
   --coordinator "$COORD" \
   --bind "127.0.0.1:${C_PORT}" \
   --advertise "$C_URL" \
@@ -466,6 +520,75 @@ assert join["implementation"] == "join-fast", join
 assert join["planned_resource"] == sys.argv[1], join
 ' "$C_ID"
 echo "dynamic-replan: ok (automatic topology; preview join-left->$A_ID, ready-time join-fast->$C_ID after hot join)"
+
+write_fusion_job "$TMP/fusion-low.json" 1
+LOW_FUSION_JOB=$(./target/debug/plurifold job auto-submit \
+  --coordinator "$COORD" --file "$TMP/fusion-low.json")
+LOW_FUSION_TASK=""
+for _ in $(seq 1 100); do
+  LOW_FUSION_VIEW=$(./target/debug/plurifold job status \
+    --coordinator "$COORD" --job "$LOW_FUSION_JOB")
+  LOW_FUSION_TASK=$(printf '%s' "$LOW_FUSION_VIEW" | json_role_task producer)
+  if [[ -n "$LOW_FUSION_TASK" ]]; then
+    break
+  fi
+  sleep 0.02
+done
+[[ -n "$LOW_FUSION_TASK" ]]
+printf '%s' "$LOW_FUSION_VIEW" | python3 -c 'import json,sys
+data=json.load(sys.stdin)
+roles={role["name"]:role for role in data["roles"]}
+assert roles["producer"]["fusion"] is None, roles["producer"]
+assert roles["consumer"]["status"] == "Waiting", roles["consumer"]
+'
+LOW_FUSION_TASK_VIEW=$(./target/debug/plurifold status \
+  --coordinator "$COORD" --task "$LOW_FUSION_TASK")
+printf '%s' "$LOW_FUSION_TASK_VIEW" | python3 -c 'import json,sys
+task=json.load(sys.stdin)["task"]
+assert "pipeline" not in task, task
+'
+./target/debug/plurifold job wait \
+  --coordinator "$COORD" --job "$LOW_FUSION_JOB" --timeout-s 10 >/dev/null
+echo "graph-granularity: low-cost edge kept separate"
+
+write_fusion_job "$TMP/fusion-high.json" 17179869184
+HIGH_FUSION_JOB=$(./target/debug/plurifold job auto-submit \
+  --coordinator "$COORD" --file "$TMP/fusion-high.json")
+HIGH_PRODUCER_TASK=""
+HIGH_CONSUMER_TASK=""
+for _ in $(seq 1 100); do
+  HIGH_FUSION_VIEW=$(./target/debug/plurifold job status \
+    --coordinator "$COORD" --job "$HIGH_FUSION_JOB")
+  HIGH_PRODUCER_TASK=$(printf '%s' "$HIGH_FUSION_VIEW" | json_role_task producer)
+  HIGH_CONSUMER_TASK=$(printf '%s' "$HIGH_FUSION_VIEW" | json_role_task consumer)
+  if [[ -n "$HIGH_PRODUCER_TASK" && -n "$HIGH_CONSUMER_TASK" ]]; then
+    break
+  fi
+  sleep 0.02
+done
+[[ -n "$HIGH_PRODUCER_TASK" && "$HIGH_PRODUCER_TASK" == "$HIGH_CONSUMER_TASK" ]]
+printf '%s' "$HIGH_FUSION_VIEW" | python3 -c 'import json,sys
+data=json.load(sys.stdin)
+roles={role["name"]:role for role in data["roles"]}
+producer=roles["producer"]
+consumer=roles["consumer"]
+assert producer["fusion"]["peer_role"] == "consumer", producer
+assert producer["fusion"]["estimated_avoided_transfer_ms"] > 20, producer
+assert producer["fusion"]["estimated_vs_separate_ms"] >= 0, producer
+assert producer["planned_resource"] == sys.argv[1], producer
+assert consumer["status"] == producer["status"], (producer, consumer)
+' "$A_ID"
+HIGH_FUSION_TASK_VIEW=$(./target/debug/plurifold status \
+  --coordinator "$COORD" --task "$HIGH_PRODUCER_TASK")
+printf '%s' "$HIGH_FUSION_TASK_VIEW" | python3 -c 'import json,sys
+pipeline=json.load(sys.stdin)["task"]["pipeline"]
+assert len(pipeline["stages"]) == 2, pipeline
+'
+./target/debug/plurifold job wait \
+  --coordinator "$COORD" --job "$HIGH_FUSION_JOB" --timeout-s 10 >/dev/null
+FUSION_EXPECTED=$(printf 'done' | sha256sum | awk '{print $1}')
+[[ -f "$TMP/a/sha256/$FUSION_EXPECTED" ]]
+echo "graph-fusion: high-cost edge fused into one task on worker-a"
 
 kill "$C_PID"
 C_PID=0

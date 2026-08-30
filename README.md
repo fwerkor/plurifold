@@ -50,7 +50,7 @@ Resource fabric
 
 ## Repository status
 
-The repository now contains a **v0.6 networked research prototype**, not only a design scaffold:
+The repository now contains a **v0.7 networked research prototype**, not only a design scaffold:
 
 - typed Resource, Task, Object, Topology, membership-lease, and execution-lease models;
 - a topology-aware placement cost model;
@@ -61,14 +61,17 @@ The repository now contains a **v0.6 networked research prototype**, not only a 
 - a logical-job planner that previews per-role implementation/resource choices using capabilities, compute cost, input locality, predicted intermediate transfers, and topology;
 - dynamic ready-time replanning: `auto-submit` keeps implementation alternatives live and chooses a role's concrete Task only after its real predecessor Objects exist, using the then-current resources and topology;
 - automatic peer topology discovery: agents measure RTT plus bounded practical HTTP throughput, report reachability to the coordinator, refresh links periodically, and withdraw automatic links when probes fail;
+- topology-driven graph coarsening for safe linear logical-role pairs: the runtime can fuse a Pure producer and its sole Pure consumer into one two-stage `TaskPipeline` when the measured communication edge is expensive and the fused placement is not worse under the current cost model;
+- in-memory fused-stage handoff: the producer's intermediate bytes stay inside one agent execution lease instead of becoming a coordinator-visible/CAS-published Object, while the final consumer output keeps the original job-visible role semantics;
+- explainable fusion decisions in job status, including the peer role, estimated avoided transfer time, and modeled delta versus the best separate execution;
 - a SHA-256 content-addressed local object cache;
 - direct agent-to-agent HTTP object transfer with digest verification and replica registration;
 - replay-safe retry after worker loss, with non-replay-safe tasks entering `Uncertain`;
 - a small builtin executor (`identity`, `concat`, `echo`, `sleep`) used to exercise the runtime without hiding unimplemented portability behind a fake generic executor;
 - a CLI for object publication, task/cooperative-job submission, planner preview/auto-submit, resource inspection, and manual topology overrides;
-- a multi-process E2E test that verifies direct peer transfer, explicit cooperative execution, hot-join-driven implementation replanning, cross-resource joins, and takeover after worker loss.
+- a multi-process E2E test that verifies direct peer transfer, explicit cooperative execution, hot-join-driven implementation replanning, low-cost no-fusion versus high-cost fusion, cross-resource joins, and takeover after worker loss.
 
-Still intentionally missing: authentication/TLS, durable coordinator state, native/WASI sandboxed executors, accelerator adapters, graph rewriting, and production-grade observability.
+Still intentionally missing: authentication/TLS, durable coordinator state, native/WASI sandboxed executors, accelerator adapters, general DAG/N-stage rewriting and batching, speculative replication/migration, and production-grade observability.
 
 ## Quick start
 
@@ -122,7 +125,7 @@ cargo run -p plurifold-cli -- job auto-submit \
   --file examples/logical-job.json
 ```
 
-`job plan` is a snapshot preview. `job auto-submit` instead stores the `LogicalJobSpec` and replans each role when its dependencies actually complete. A ready role with no currently feasible implementation stays `Ready` and is retried as resources/topology change. Role boundaries are still declared by the application or a domain library; v0.6 does **not** infer arbitrary program decomposition. Predicted resources are advisory rather than hard bindings, and lease-time scheduling remains authoritative.
+`job plan` is a snapshot preview. `job auto-submit` instead stores the `LogicalJobSpec` and replans each role when its dependencies actually complete. A ready role with no currently feasible implementation stays `Ready` and is retried as resources/topology change. Before materializing an eligible linear producer, v0.7 also looks ahead to its sole consumer and may replace the pair with one `TaskPipeline`. This first coarsening rule is deliberately narrow: both roles must be Pure builtin-family implementations, the producer cannot be a job output or fan out, and the consumer must depend only on that producer. Role boundaries are still declared by the application or a domain library; v0.7 does **not** infer arbitrary program decomposition. Predicted resources are advisory rather than hard bindings, and lease-time scheduling remains authoritative.
 
 ## Design invariants
 

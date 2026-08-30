@@ -173,6 +173,29 @@ pub struct TaskSpec {
     pub requirements: ResourceRequirements,
     pub effects: EffectSemantics,
     pub cost: CostHint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<TaskPipeline>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskPipeline {
+    pub stages: Vec<TaskPipelineStage>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskPipelineStage {
+    pub artifact: String,
+    pub entrypoint: String,
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    pub inputs: Vec<PipelineInput>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PipelineInput {
+    External { index: usize },
+    PreviousOutput,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -201,6 +224,7 @@ impl TaskTemplate {
             requirements: self.requirements.clone(),
             effects: self.effects.clone(),
             cost: self.cost.clone(),
+            pipeline: None,
         }
     }
 }

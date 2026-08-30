@@ -29,20 +29,24 @@ Cooperative Job
 
 ### Logical planner
 
-A `LogicalJobSpec` keeps the role/dependency graph explicit but allows each role to advertise multiple Task implementations. A snapshot planner can preview a concrete `CooperativeJobSpec`, but v0.6 logical execution keeps the alternatives live instead of treating that preview as the execution contract.
+A `LogicalJobSpec` keeps the role/dependency graph explicit but allows each role to advertise multiple Task implementations. A snapshot planner can preview a concrete `CooperativeJobSpec`, but v0.7 logical execution keeps the alternatives live instead of treating that preview as the execution contract.
 
 For each ready role it scores implementation/resource pairs with the ordinary topology-aware scheduler. Predicted predecessor outputs are represented as temporary planning objects located at the chosen predecessor resources, with size derived from the selected implementation's output-size hint. This lets a downstream choice account for the communication cost created by upstream choices instead of selecting every role independently.
 
 The preview planner also tracks predicted resource availability so independent roles can be spread across idle resources rather than accidentally serialized on one worker. Its placement output is advisory.
 
-For `auto-submit`, a role is concretized only when all of its predecessors have actually completed. At that point the runtime scores its implementation alternatives against the current schedulable resources, current topology, and the real published predecessor Object locations/sizes. A role with satisfied dependencies but no feasible implementation enters `Ready`; agent polling retries ready roles, so a later resource hot join can make progress without resubmitting the logical job. The resulting Task then follows the ordinary scheduler and execution-lease path.
+For `auto-submit`, a role is normally concretized only when all of its predecessors have actually completed. At that point the runtime scores its implementation alternatives against the current schedulable resources, current topology, and the real published predecessor Object locations/sizes. A role with satisfied dependencies but no feasible implementation enters `Ready`; agent polling retries ready roles, so a later resource hot join can make progress without resubmitting the logical job. The resulting Task then follows the ordinary scheduler and execution-lease path.
 
 ### Graph runtime
 
-The runtime tracks dependencies and may perform semantics-preserving transformations:
+The runtime tracks dependencies and may perform semantics-preserving transformations. v0.7 implements the first production transformation: look-ahead fusion of a two-role linear chain. Before a logical producer is submitted, the runtime may inspect its sole consumer, compare separate execution paths against a same-resource coarse task, and materialize one `TaskPipeline` when measured transfer cost makes the edge communication-sensitive and the fused task is not worse under the current model.
+
+The v0.7 safety envelope is intentionally strict: both roles must expose only Pure builtin-family implementations; the producer cannot be an externally visible job output or have another consumer; the consumer must depend only on that producer; and their resource requirements must be representable by one combined requirement set. A fused task retains one normal execution lease. Its intermediate bytes are passed between pipeline stages in agent memory and are not published as an Object; only the final consumer output is published. Job status keeps both logical roles and records the fusion relationship and cost estimates.
+
+Other graph transformations remain research work:
 
 - task batching;
-- producer/consumer fusion;
+- N-stage/general-DAG producer/consumer fusion;
 - speculative replication;
 - checkpoint insertion;
 - migration at checkpoint boundaries;
@@ -99,7 +103,7 @@ The topology model classifies links by observed RTT/bandwidth rather than admini
 
 These thresholds are policy defaults, not correctness rules. Runtime measurements can override them.
 
-In v0.6 the link graph is maintained from active peer probes rather than requiring topology to be injected manually. Agents measure peer RTT and bounded practical HTTP throughput in the background without blocking heartbeats or work polling. Failed probes withdraw automatic links. Explicit operator links remain authoritative overrides. This still assumes the advertised peer endpoints are directly routable; relay/NAT traversal is a separate transport problem.
+In v0.7 the link graph is maintained from active peer probes rather than requiring topology to be injected manually. Agents measure peer RTT and bounded practical HTTP throughput in the background without blocking heartbeats or work polling. Failed probes withdraw automatic links. Explicit operator links remain authoritative overrides. The same measured links now also drive the first graph-coarsening decision. This still assumes the advertised peer endpoints are directly routable; relay/NAT traversal is a separate transport problem.
 
 ## 4. Control plane vs data plane
 
