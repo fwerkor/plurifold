@@ -193,6 +193,7 @@ mod tests {
                 compute_ms_on_reference: compute_ms,
                 output_bytes: 0,
             },
+            shard: None,
             pipeline: None,
         }
     }

@@ -2,10 +2,9 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use plurifold_core::{
-    AcceleratorRequirement, Architecture, CooperativeJobSpec, CooperativeRoleSpec, EffectSemantics,
-    LogicalJobSpec, ObjectId, ObjectMetadata, PipelineInput, ResourceDescriptor, ResourceId,
-    ResourceRequirements, TaskId, TaskPipeline, TaskPipelineStage, TaskSpec, TaskTemplate,
-    TopologySnapshot,
+    AcceleratorRequirement, Architecture, EffectSemantics, LogicalJobSpec, ObjectId,
+    ObjectMetadata, PipelineInput, ResourceDescriptor, ResourceId, ResourceRequirements, TaskId,
+    TaskPipeline, TaskPipelineStage, TaskShard, TaskSpec, TaskTemplate, TopologySnapshot,
 };
 use plurifold_scheduler::{
     FusionAdvisor, PlacementBreakdown, ScheduleError, TopologyAwareScheduler,
@@ -27,15 +26,20 @@ pub struct PlannedPlacement {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PlannedRole {
-    pub name: String,
+pub struct PlannedShard {
+    pub index: u32,
     pub implementation: String,
     pub placement: PlannedPlacement,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlannedRole {
+    pub name: String,
+    pub shards: Vec<PlannedShard>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CooperativePlan {
-    pub job: CooperativeJobSpec,
     pub roles: Vec<PlannedRole>,
     pub estimated_makespan_ms: f64,
 }
@@ -50,23 +54,23 @@ pub enum PlanError {
 
 #[derive(Clone)]
 struct SelectedRole {
-    task: TaskTemplate,
-    output: ObjectId,
+    outputs: Vec<ObjectId>,
     finish_ms: f64,
-}
-
-struct Candidate<'a> {
-    implementation_name: &'a str,
-    task: &'a TaskTemplate,
-    resource_id: ResourceId,
-    start_ms: f64,
-    cost: PlacementBreakdown,
 }
 
 pub(crate) struct ReadyRoleSelection {
     pub implementation: String,
-    pub task: plurifold_core::TaskSpec,
+    pub task: TaskSpec,
     pub resource_id: ResourceId,
+    pub cost: PlacementBreakdown,
+}
+
+pub(crate) struct ReadyShardSelection {
+    pub index: u32,
+    pub implementation: String,
+    pub task: TaskSpec,
+    pub resource_id: ResourceId,
+    pub start_ms: f64,
     pub cost: PlacementBreakdown,
 }
 
@@ -109,6 +113,13 @@ pub(crate) struct FusionContext<'a> {
     pub topology: &'a TopologySnapshot,
 }
 
+pub(crate) struct ShardPlanningContext<'a> {
+    pub scheduler: &'a TopologyAwareScheduler,
+    pub resources: &'a [ResourceDescriptor],
+    pub objects: &'a HashMap<ObjectId, ObjectMetadata>,
+    pub topology: &'a TopologySnapshot,
+}
+
 pub(crate) fn select_ready_role(
     role: &plurifold_core::LogicalRoleSpec,
     dependency_inputs: &[ObjectId],
@@ -139,6 +150,90 @@ pub(crate) fn select_ready_role(
         }
     }
     best
+}
+
+pub(crate) fn select_ready_shards(
+    role: &plurifold_core::LogicalRoleSpec,
+    dependency_inputs: &[ObjectId],
+    context: &ShardPlanningContext<'_>,
+) -> Option<Vec<ReadyShardSelection>> {
+    let mut availability = HashMap::<ResourceId, f64>::new();
+    choose_shards(
+        role,
+        dependency_inputs,
+        role.shards,
+        0.0,
+        &mut availability,
+        context,
+    )
+}
+
+fn choose_shards(
+    role: &plurifold_core::LogicalRoleSpec,
+    dependency_inputs: &[ObjectId],
+    shard_count: u32,
+    dependency_ready_ms: f64,
+    resource_available_ms: &mut HashMap<ResourceId, f64>,
+    context: &ShardPlanningContext<'_>,
+) -> Option<Vec<ReadyShardSelection>> {
+    let mut selections = Vec::with_capacity(shard_count as usize);
+    for index in 0..shard_count {
+        let mut best: Option<ReadyShardSelection> = None;
+        for implementation in &role.implementations {
+            let mut task = implementation
+                .task
+                .instantiate(dependency_inputs.iter().copied());
+            task.shard = Some(TaskShard {
+                index,
+                count: shard_count,
+            });
+            for resource in context.resources {
+                let Some(cost) = placement_cost(
+                    context.scheduler,
+                    &task,
+                    resource,
+                    context.objects,
+                    context.topology,
+                ) else {
+                    continue;
+                };
+                let start_ms = dependency_ready_ms.max(
+                    resource_available_ms
+                        .get(&resource.id)
+                        .copied()
+                        .unwrap_or(0.0),
+                );
+                let finish_ms = start_ms + cost.total_ms;
+                let replace = best
+                    .as_ref()
+                    .map(|current| {
+                        match finish_ms.total_cmp(&(current.start_ms + current.cost.total_ms)) {
+                            Ordering::Less => true,
+                            Ordering::Equal => cost.total_ms < current.cost.total_ms,
+                            Ordering::Greater => false,
+                        }
+                    })
+                    .unwrap_or(true);
+                if replace {
+                    best = Some(ReadyShardSelection {
+                        index,
+                        implementation: implementation.name.clone(),
+                        task: task.clone(),
+                        resource_id: resource.id,
+                        start_ms,
+                        cost,
+                    });
+                }
+            }
+        }
+        let selected = best?;
+        resource_available_ms.insert(
+            selected.resource_id,
+            selected.start_ms + selected.cost.total_ms,
+        );
+        selections.push(selected);
+    }
+    Some(selections)
 }
 
 pub(crate) fn select_ready_fusion(
@@ -546,6 +641,7 @@ fn fused_pipeline_task(
                 .sum(),
             output_bytes: tasks.last().map(|task| task.cost.output_bytes).unwrap_or(0),
         },
+        shard: None,
         pipeline: Some(TaskPipeline { stages }),
     }
 }
@@ -616,7 +712,7 @@ pub(crate) fn plan(
         let dependency_inputs = role
             .depends_on
             .iter()
-            .map(|dependency| selected[dependency].output)
+            .flat_map(|dependency| selected[dependency].outputs.iter().copied())
             .collect::<Vec<_>>();
         let dependency_ready_ms = role
             .depends_on
@@ -624,101 +720,68 @@ pub(crate) fn plan(
             .map(|dependency| selected[dependency].finish_ms)
             .fold(0.0_f64, f64::max);
 
-        let mut best: Option<Candidate<'_>> = None;
-        for implementation in &role.implementations {
-            let task = implementation
-                .task
-                .instantiate(dependency_inputs.iter().copied());
-            for resource in resources {
-                let Some(cost) =
-                    placement_cost(scheduler, &task, resource, &predicted_objects, topology)
-                else {
-                    continue;
-                };
-                let start_ms = dependency_ready_ms.max(
-                    resource_available_ms
-                        .get(&resource.id)
-                        .copied()
-                        .unwrap_or(0.0),
-                );
-                let finish_ms = start_ms + cost.total_ms;
-                let replace = best
-                    .as_ref()
-                    .map(|current| {
-                        match finish_ms.total_cmp(&(current.start_ms + current.cost.total_ms)) {
-                            Ordering::Less => true,
-                            Ordering::Equal => cost.total_ms < current.cost.total_ms,
-                            Ordering::Greater => false,
-                        }
-                    })
-                    .unwrap_or(true);
-                if replace {
-                    best = Some(Candidate {
-                        implementation_name: &implementation.name,
-                        task: &implementation.task,
-                        resource_id: resource.id,
-                        start_ms,
-                        cost,
-                    });
-                }
-            }
-        }
-
-        let Some(best) = best else {
+        let Some(shards) = choose_shards(
+            role,
+            &dependency_inputs,
+            role.shards,
+            dependency_ready_ms,
+            &mut resource_available_ms,
+            &ShardPlanningContext {
+                scheduler,
+                resources,
+                objects: &predicted_objects,
+                topology,
+            },
+        ) else {
             return Err(PlanError::NoFeasibleImplementation(role.name.clone()));
         };
-        let finish_ms = best.start_ms + best.cost.total_ms;
-        resource_available_ms.insert(best.resource_id, finish_ms);
 
-        let output = ObjectId::new();
-        predicted_objects.insert(
-            output,
-            ObjectMetadata {
-                id: output,
-                size_bytes: best.task.cost.output_bytes,
-                digest: None,
-                encoding: None,
-                locations: vec![best.resource_id],
-                producer: None,
-            },
-        );
-        selected.insert(
-            role.name.clone(),
-            SelectedRole {
-                task: best.task.clone(),
+        let mut outputs = Vec::with_capacity(shards.len());
+        let mut planned_shards = Vec::with_capacity(shards.len());
+        let mut finish_ms = dependency_ready_ms;
+        for shard in shards {
+            let shard_finish_ms = shard.start_ms + shard.cost.total_ms;
+            finish_ms = finish_ms.max(shard_finish_ms);
+            let output = ObjectId::new();
+            predicted_objects.insert(
                 output,
-                finish_ms,
-            },
-        );
+                ObjectMetadata {
+                    id: output,
+                    size_bytes: shard.task.cost.output_bytes,
+                    digest: None,
+                    encoding: None,
+                    locations: vec![shard.resource_id],
+                    producer: None,
+                },
+            );
+            outputs.push(output);
+            planned_shards.push(PlannedShard {
+                index: shard.index,
+                implementation: shard.implementation,
+                placement: PlannedPlacement {
+                    resource_id: shard.resource_id,
+                    start_ms: shard.start_ms,
+                    finish_ms: shard_finish_ms,
+                    compute_ms: shard.cost.compute_ms,
+                    input_transfer_ms: shard.cost.input_transfer_ms,
+                    queue_ms: shard.cost.queue_ms,
+                    startup_ms: shard.cost.startup_ms,
+                    risk_penalty_ms: shard.cost.risk_penalty_ms,
+                    total_ms: shard.cost.total_ms,
+                },
+            });
+        }
+
+        selected.insert(role.name.clone(), SelectedRole { outputs, finish_ms });
         planned_roles.insert(
             role.name.clone(),
             PlannedRole {
                 name: role.name.clone(),
-                implementation: best.implementation_name.to_owned(),
-                placement: PlannedPlacement {
-                    resource_id: best.resource_id,
-                    start_ms: best.start_ms,
-                    finish_ms,
-                    compute_ms: best.cost.compute_ms,
-                    input_transfer_ms: best.cost.input_transfer_ms,
-                    queue_ms: best.cost.queue_ms,
-                    startup_ms: best.cost.startup_ms,
-                    risk_penalty_ms: best.cost.risk_penalty_ms,
-                    total_ms: best.cost.total_ms,
-                },
+                shards: planned_shards,
             },
         );
     }
 
-    let roles = spec
-        .roles
-        .iter()
-        .map(|role| CooperativeRoleSpec {
-            name: role.name.clone(),
-            task: selected[&role.name].task.clone(),
-            depends_on: role.depends_on.clone(),
-        })
-        .collect();
     let estimated_makespan_ms = spec
         .outputs
         .iter()
@@ -726,11 +789,6 @@ pub(crate) fn plan(
         .fold(0.0_f64, f64::max);
 
     Ok(CooperativePlan {
-        job: CooperativeJobSpec {
-            id: spec.id,
-            roles,
-            outputs: spec.outputs.clone(),
-        },
         roles: spec
             .roles
             .iter()
@@ -764,7 +822,12 @@ fn feasible_candidate_count(
     let dependency_inputs = role
         .depends_on
         .iter()
-        .filter_map(|dependency| selected.get(dependency).map(|role| role.output))
+        .flat_map(|dependency| {
+            selected
+                .get(dependency)
+                .into_iter()
+                .flat_map(|role| role.outputs.iter().copied())
+        })
         .collect::<Vec<_>>();
 
     role.implementations
@@ -793,6 +856,12 @@ pub(crate) fn validate_logical_job(spec: &LogicalJobSpec) -> Result<(), PlanErro
     .map_err(PlanError::InvalidLogicalJob)?;
 
     for role in &spec.roles {
+        if role.shards == 0 {
+            return Err(PlanError::InvalidLogicalJob(format!(
+                "role {} must request at least one shard",
+                role.name
+            )));
+        }
         if role.implementations.is_empty() {
             return Err(PlanError::InvalidLogicalJob(format!(
                 "role {} has no implementations",
@@ -953,6 +1022,7 @@ mod tests {
                     implementation("accelerator", "backend:accel", 1_000.0, 1),
                 ],
                 depends_on: vec![],
+                shards: 1,
             }],
             outputs: vec!["compute".into()],
         };
@@ -969,8 +1039,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(plan.roles[0].implementation, "accelerator");
-        assert_eq!(plan.roles[0].placement.resource_id, accelerator);
+        assert_eq!(plan.roles[0].shards[0].implementation, "accelerator");
+        assert_eq!(plan.roles[0].shards[0].placement.resource_id, accelerator);
     }
 
     #[test]
@@ -989,6 +1059,7 @@ mod tests {
                         100 << 20,
                     )],
                     depends_on: vec![],
+                    shards: 1,
                 },
                 LogicalRoleSpec {
                     name: "small".into(),
@@ -999,6 +1070,7 @@ mod tests {
                         1 << 20,
                     )],
                     depends_on: vec![],
+                    shards: 1,
                 },
                 LogicalRoleSpec {
                     name: "join".into(),
@@ -1007,6 +1079,7 @@ mod tests {
                         implementation("join-right", "site:right", 100.0, 1),
                     ],
                     depends_on: vec!["large".into(), "small".into()],
+                    shards: 1,
                 },
             ],
             outputs: vec!["join".into()],
@@ -1033,9 +1106,9 @@ mod tests {
         .unwrap();
         let join = plan.roles.iter().find(|role| role.name == "join").unwrap();
 
-        assert_eq!(join.implementation, "join-left");
-        assert_eq!(join.placement.resource_id, left);
-        assert!(join.placement.input_transfer_ms < 500.0);
+        assert_eq!(join.shards[0].implementation, "join-left");
+        assert_eq!(join.shards[0].placement.resource_id, left);
+        assert!(join.shards[0].placement.input_transfer_ms < 500.0);
     }
 
     #[test]
@@ -1060,6 +1133,7 @@ mod tests {
                 },
             }],
             depends_on: vec![],
+            shards: 1,
         };
         let logical = LogicalJobSpec {
             id: Default::default(),
@@ -1080,11 +1154,90 @@ mod tests {
         .unwrap();
 
         assert_ne!(
-            plan.roles[0].placement.resource_id,
-            plan.roles[1].placement.resource_id
+            plan.roles[0].shards[0].placement.resource_id,
+            plan.roles[1].shards[0].placement.resource_id
         );
-        assert_eq!(plan.roles[0].placement.start_ms, 0.0);
-        assert_eq!(plan.roles[1].placement.start_ms, 0.0);
+        assert_eq!(plan.roles[0].shards[0].placement.start_ms, 0.0);
+        assert_eq!(plan.roles[1].shards[0].placement.start_ms, 0.0);
         assert_eq!(plan.estimated_makespan_ms, 1_000.0);
+    }
+
+    #[test]
+    fn sharded_preview_spreads_then_reuses_resources_when_needed() {
+        let first = ResourceId::new();
+        let second = ResourceId::new();
+        let logical = LogicalJobSpec {
+            id: Default::default(),
+            roles: vec![LogicalRoleSpec {
+                name: "map".into(),
+                implementations: vec![implementation("worker", "shard:work", 1_000.0, 4)],
+                depends_on: vec![],
+                shards: 3,
+            }],
+            outputs: vec!["map".into()],
+        };
+
+        let plan = plan(
+            &logical,
+            &TopologyAwareScheduler::default(),
+            &[
+                resource(first, 1.0, "shard:work"),
+                resource(second, 1.0, "shard:work"),
+            ],
+            &HashMap::new(),
+            &TopologySnapshot::default(),
+        )
+        .unwrap();
+
+        let shards = &plan.roles[0].shards;
+        assert_eq!(shards.len(), 3);
+        assert_ne!(
+            shards[0].placement.resource_id,
+            shards[1].placement.resource_id
+        );
+        assert_eq!(shards[0].placement.start_ms, 0.0);
+        assert_eq!(shards[1].placement.start_ms, 0.0);
+        assert!(shards[2].placement.start_ms >= 1_000.0);
+        assert_eq!(plan.estimated_makespan_ms, 2_000.0);
+    }
+
+    #[test]
+    fn sharded_preview_can_mix_implementations_across_resources() {
+        let cpu = ResourceId::new();
+        let accelerator = ResourceId::new();
+        let logical = LogicalJobSpec {
+            id: Default::default(),
+            roles: vec![LogicalRoleSpec {
+                name: "map".into(),
+                implementations: vec![
+                    implementation("cpu", "backend:cpu", 1_000.0, 4),
+                    implementation("accelerator", "backend:accel", 1_000.0, 4),
+                ],
+                depends_on: vec![],
+                shards: 2,
+            }],
+            outputs: vec!["map".into()],
+        };
+
+        let plan = plan(
+            &logical,
+            &TopologyAwareScheduler::default(),
+            &[
+                resource(cpu, 1.0, "backend:cpu"),
+                resource(accelerator, 1.0, "backend:accel"),
+            ],
+            &HashMap::new(),
+            &TopologySnapshot::default(),
+        )
+        .unwrap();
+
+        let shards = &plan.roles[0].shards;
+        assert_eq!(shards.len(), 2);
+        assert_eq!(shards[0].implementation, "cpu");
+        assert_eq!(shards[0].placement.resource_id, cpu);
+        assert_eq!(shards[1].implementation, "accelerator");
+        assert_eq!(shards[1].placement.resource_id, accelerator);
+        assert_eq!(shards[0].placement.start_ms, 0.0);
+        assert_eq!(shards[1].placement.start_ms, 0.0);
     }
 }

@@ -176,6 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         output_bytes,
                     },
                     pipeline: None,
+                    shard: None,
                 },
             )
             .await?;
@@ -492,6 +493,7 @@ fn demo() {
             compute_ms_on_reference: 5_000.0,
             output_bytes: 1 << 20,
         },
+        shard: None,
         pipeline: None,
     };
     let task_id = fabric.submit(task).unwrap();

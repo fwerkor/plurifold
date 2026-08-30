@@ -209,6 +209,8 @@ wait_http "$COORD/healthz"
   --name worker-a \
   --performance 2 \
   --feature demo:role-left \
+  --feature demo:shard \
+  --feature demo:shard-join \
   --feature fusion:producer \
   --feature fusion:middle \
   --feature fusion:consumer \
@@ -227,6 +229,7 @@ PIDS+=("$A_PID")
   --name worker-b \
   --performance 1 \
   --feature demo:role-right \
+  --feature demo:shard \
   --coordinator "$COORD" \
   --bind "127.0.0.1:${B_PORT}" \
   --advertise "$B_URL" \
@@ -519,10 +522,10 @@ AUTO_PLAN=$(./target/debug/plurifold job plan --coordinator "$COORD" --file "$TM
 printf '%s' "$AUTO_PLAN" | python3 -c 'import json,sys
 data=json.load(sys.stdin)
 expected={"left":("left-native",sys.argv[1]),"right":("right-native",sys.argv[2]),"join":("join-left",sys.argv[1])}
-seen={role["name"]:(role["implementation"],role["placement"]["resource_id"]) for role in data["roles"]}
+seen={role["name"]:(role["shards"][0]["implementation"],role["shards"][0]["placement"]["resource_id"]) for role in data["roles"]}
 assert seen == expected, (seen, expected)
 join=next(role for role in data["roles"] if role["name"] == "join")
-assert join["placement"]["input_transfer_ms"] > 0
+assert join["shards"][0]["placement"]["input_transfer_ms"] > 0
 ' "$A_ID" "$B_ID"
 
 AUTO_JOB=$(./target/debug/plurifold job auto-submit --coordinator "$COORD" --file "$TMP/logical-job.json")
@@ -558,6 +561,7 @@ done
   --name worker-c \
   --performance 20 \
   --feature demo:join-fast \
+  --feature demo:shard \
   --feature fusion:middle \
   --feature fusion:consumer \
   --coordinator "$COORD" \
@@ -594,6 +598,100 @@ assert join["implementation"] == "join-fast", join
 assert join["planned_resource"] == sys.argv[1], join
 ' "$C_ID"
 echo "dynamic-replan: ok (automatic topology; preview join-left->$A_ID, ready-time join-fast->$C_ID after hot join)"
+
+cat >"$TMP/sharded-job.json" <<'JSON'
+{
+  "roles": [
+    {
+      "name": "map",
+      "implementations": [{
+        "name": "shard-worker",
+        "task": {
+          "artifact": "builtin:shard-sleep",
+          "entrypoint": "run",
+          "arguments": ["2500", "piece"],
+          "requirements": {
+            "architecture": null,
+            "min_memory_bytes": 0,
+            "accelerator": null,
+            "required_features": ["demo:shard"]
+          },
+          "effects": "Pure",
+          "cost": {"compute_ms_on_reference": 2500.0, "output_bytes": 9}
+        }
+      }],
+      "depends_on": [],
+      "shards": 3
+    },
+    {
+      "name": "join",
+      "implementations": [{
+        "name": "join-worker",
+        "task": {
+          "artifact": "builtin:concat",
+          "entrypoint": "run",
+          "requirements": {
+            "architecture": null,
+            "min_memory_bytes": 0,
+            "accelerator": null,
+            "required_features": ["demo:shard-join"]
+          },
+          "effects": "Pure",
+          "cost": {"compute_ms_on_reference": 100.0, "output_bytes": 27}
+        }
+      }],
+      "depends_on": ["map"]
+    }
+  ],
+  "outputs": ["join"]
+}
+JSON
+
+SHARDED_JOB=$(./target/debug/plurifold job auto-submit \
+  --coordinator "$COORD" --file "$TMP/sharded-job.json")
+SHARD_RESOURCES=""
+for _ in $(seq 1 120); do
+  SHARDED_VIEW=$(./target/debug/plurifold job status --coordinator "$COORD" --job "$SHARDED_JOB")
+  SHARD_RESOURCES=$(printf '%s' "$SHARDED_VIEW" | python3 -c 'import json,sys
+role=next(role for role in json.load(sys.stdin)["roles"] if role["name"]=="map")
+r=[]
+for shard in role.get("shards",[]):
+    status=shard["status"]
+    if isinstance(status,dict) and "Running" in status:
+        r.append(status["Running"]["resource_id"])
+if len(r)==3:
+    print(" ".join(r))')
+  if [[ -n "$SHARD_RESOURCES" ]]; then
+    break
+  fi
+  sleep 0.05
+done
+[[ -n "$SHARD_RESOURCES" ]]
+printf '%s' "$SHARD_RESOURCES" | python3 -c 'import sys
+seen=set(sys.stdin.read().split())
+expected=set(sys.argv[1:])
+assert seen==expected,(seen,expected)
+' "$A_ID" "$B_ID" "$C_ID"
+printf '%s' "$SHARDED_VIEW" | python3 -c 'import json,sys
+role=next(role for role in json.load(sys.stdin)["roles"] if role["name"]=="map")
+assert len(role["shards"])==3, role
+for i,shard in enumerate(role["shards"]):
+    assert shard["index"]==i, shard
+'
+./target/debug/plurifold job wait \
+  --coordinator "$COORD" --job "$SHARDED_JOB" --timeout-s 12 >/dev/null
+SHARDED_EXPECTED=$(printf 'piece:0:3piece:1:3piece:2:3' | sha256sum | awk '{print $1}')
+[[ -f "$TMP/a/sha256/$SHARDED_EXPECTED" ]]
+SHARDED_FINAL_VIEW=$(./target/debug/plurifold job status --coordinator "$COORD" --job "$SHARDED_JOB")
+printf '%s' "$SHARDED_FINAL_VIEW" | python3 -c 'import json,sys
+data=json.load(sys.stdin)
+map_role=next(role for role in data["roles"] if role["name"]=="map")
+join=next(role for role in data["roles"] if role["name"]=="join")
+assert "Completed" in map_role["status"], map_role
+assert len(map_role["status"]["Completed"])==3, map_role
+assert join["planned_resource"]==sys.argv[1], join
+' "$A_ID"
+echo "fan-out-fan-in: 3 shards ran concurrently on A/B/C and joined on worker-a"
 
 write_fusion_job "$TMP/fusion-low.json" 1
 LOW_FUSION_JOB=$(./target/debug/plurifold job auto-submit \

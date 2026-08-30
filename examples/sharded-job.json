@@ -1,0 +1,55 @@
+{
+  "roles": [
+    {
+      "name": "map",
+      "implementations": [
+        {
+          "name": "shard-worker",
+          "task": {
+            "artifact": "builtin:shard-echo",
+            "entrypoint": "run",
+            "arguments": ["piece"],
+            "requirements": {
+              "architecture": null,
+              "min_memory_bytes": 0,
+              "accelerator": null,
+              "required_features": []
+            },
+            "effects": "Pure",
+            "cost": {
+              "compute_ms_on_reference": 1000.0,
+              "output_bytes": 9
+            }
+          }
+        }
+      ],
+      "depends_on": [],
+      "shards": 3
+    },
+    {
+      "name": "join",
+      "implementations": [
+        {
+          "name": "concat",
+          "task": {
+            "artifact": "builtin:concat",
+            "entrypoint": "run",
+            "requirements": {
+              "architecture": null,
+              "min_memory_bytes": 0,
+              "accelerator": null,
+              "required_features": []
+            },
+            "effects": "Pure",
+            "cost": {
+              "compute_ms_on_reference": 100.0,
+              "output_bytes": 27
+            }
+          }
+        }
+      ],
+      "depends_on": ["map"]
+    }
+  ],
+  "outputs": ["join"]
+}

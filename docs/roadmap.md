@@ -46,7 +46,8 @@
 - [x] multi-process hot-join E2E where downstream implementation choice changes after submission
 - [ ] dynamic role insertion while a job is running
 - [ ] automatic role-boundary inference/decomposition from higher-level computation graphs or source programs
-- [ ] elastic role replication and quorum/reduction policies
+- [x] explicit sharded roles with multi-resource fan-out and deterministic all-shards fan-in
+- [ ] adaptive shard-count selection, automatic input partitioning, and hierarchical/quorum reduction policies
 
 ## Phase 3 — Topology and graph adaptation
 
@@ -54,7 +55,7 @@
 - [x] peer link graph maintenance and latency domains from live measurements
 - [x] topology-driven safe linear producer/consumer fusion with in-memory intermediate handoff
 - [x] adaptive multi-stage linear-chain fusion with end-to-end prefix-cost selection
-- [ ] general-DAG fan-out/fan-in fusion and automatic batching
+- [ ] arbitrary general-DAG fan-out/fan-in fusion and automatic batching
 - [ ] speculative replication
 - [ ] checkpoint-aware migration
 - [ ] policy simulator and trace replay

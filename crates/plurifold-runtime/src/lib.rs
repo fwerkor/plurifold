@@ -14,7 +14,7 @@ use thiserror::Error;
 
 mod planner;
 
-pub use planner::{CooperativePlan, PlanError, PlannedPlacement, PlannedRole};
+pub use planner::{CooperativePlan, PlanError, PlannedPlacement, PlannedRole, PlannedShard};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum TaskStatus {
@@ -31,6 +31,10 @@ pub enum CooperativeRoleStatus {
     /// Dependencies are complete, but no implementation is currently feasible.
     Ready,
     Submitted(TaskId),
+    Sharded {
+        tasks: Vec<TaskId>,
+        completed: usize,
+    },
     Completed(Vec<ObjectId>),
     Uncertain,
 }
@@ -51,6 +55,18 @@ pub struct CooperativeRoleView {
     pub planned_resource: Option<ResourceId>,
     pub estimated_total_ms: Option<f64>,
     pub fusion: Option<RoleFusionView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shards: Vec<RoleShardView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoleShardView {
+    pub index: u32,
+    pub task_id: TaskId,
+    pub implementation: String,
+    pub planned_resource: ResourceId,
+    pub estimated_total_ms: f64,
+    pub status: TaskStatus,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -81,11 +97,23 @@ struct CooperativeJobRecord {
 }
 
 #[derive(Clone, Debug)]
-struct RoleSelection {
+enum RoleSelection {
+    Single {
+        implementation: String,
+        planned_resource: ResourceId,
+        estimated_total_ms: f64,
+        fusion: Option<RoleFusionView>,
+    },
+    Sharded(Vec<ShardSelection>),
+}
+
+#[derive(Clone, Debug)]
+struct ShardSelection {
+    index: u32,
+    task_id: TaskId,
     implementation: String,
     planned_resource: ResourceId,
     estimated_total_ms: f64,
-    fusion: Option<RoleFusionView>,
 }
 
 #[derive(Clone, Debug)]
@@ -97,6 +125,10 @@ enum TaskRoleBinding {
     FusedChain {
         job_id: JobId,
         role_names: Vec<String>,
+    },
+    Shard {
+        job_id: JobId,
+        role_name: String,
     },
 }
 
@@ -396,30 +428,60 @@ impl Fabric {
         Some(
             job_roles(&record.definition)
                 .into_iter()
-                .map(|(name, depends_on)| CooperativeRoleView {
-                    status: record
-                        .roles
-                        .get(&name)
-                        .cloned()
-                        .expect("validated cooperative role has runtime state"),
-                    implementation: record
-                        .selections
-                        .get(&name)
-                        .map(|selection| selection.implementation.clone()),
-                    planned_resource: record
-                        .selections
-                        .get(&name)
-                        .map(|selection| selection.planned_resource),
-                    estimated_total_ms: record
-                        .selections
-                        .get(&name)
-                        .map(|selection| selection.estimated_total_ms),
-                    fusion: record
-                        .selections
-                        .get(&name)
-                        .and_then(|selection| selection.fusion.clone()),
-                    name,
-                    depends_on,
+                .map(|(name, depends_on)| {
+                    let selection = record.selections.get(&name);
+                    let (implementation, planned_resource, estimated_total_ms, fusion, shards) =
+                        match selection {
+                            Some(RoleSelection::Single {
+                                implementation,
+                                planned_resource,
+                                estimated_total_ms,
+                                fusion,
+                            }) => (
+                                Some(implementation.clone()),
+                                Some(*planned_resource),
+                                Some(*estimated_total_ms),
+                                fusion.clone(),
+                                Vec::new(),
+                            ),
+                            Some(RoleSelection::Sharded(selections)) => (
+                                None,
+                                None,
+                                None,
+                                None,
+                                selections
+                                    .iter()
+                                    .map(|selection| RoleShardView {
+                                        index: selection.index,
+                                        task_id: selection.task_id,
+                                        implementation: selection.implementation.clone(),
+                                        planned_resource: selection.planned_resource,
+                                        estimated_total_ms: selection.estimated_total_ms,
+                                        status: self
+                                            .tasks
+                                            .get(&selection.task_id)
+                                            .expect("selected shard task exists")
+                                            .status
+                                            .clone(),
+                                    })
+                                    .collect(),
+                            ),
+                            None => (None, None, None, None, Vec::new()),
+                        };
+                    CooperativeRoleView {
+                        status: record
+                            .roles
+                            .get(&name)
+                            .cloned()
+                            .expect("validated cooperative role has runtime state"),
+                        implementation,
+                        planned_resource,
+                        estimated_total_ms,
+                        fusion,
+                        shards,
+                        name,
+                        depends_on,
+                    }
                 })
                 .collect(),
         )
@@ -674,6 +736,47 @@ impl Fabric {
                 *status = CooperativeRoleStatus::Completed(outputs);
                 job_id
             }
+            TaskRoleBinding::Shard { job_id, role_name } => {
+                let task_ids = match self
+                    .jobs
+                    .get(&job_id)
+                    .and_then(|job| job.roles.get(&role_name))
+                {
+                    Some(CooperativeRoleStatus::Sharded { tasks, .. }) => tasks.clone(),
+                    Some(CooperativeRoleStatus::Uncertain) => return Ok(()),
+                    _ => {
+                        return Err(FabricError::InvalidLogicalJob(format!(
+                            "runtime state is missing sharded role {role_name}"
+                        )))
+                    }
+                };
+                let mut completed = 0usize;
+                let mut all_outputs = Vec::new();
+                for shard_task in &task_ids {
+                    if let Some(TaskStatus::Completed(outputs)) = self.task_status(*shard_task) {
+                        completed += 1;
+                        all_outputs.extend(outputs.iter().copied());
+                    }
+                }
+                let job = self
+                    .jobs
+                    .get_mut(&job_id)
+                    .ok_or(FabricError::UnknownJob(job_id))?;
+                let status = job.roles.get_mut(&role_name).ok_or_else(|| {
+                    FabricError::InvalidLogicalJob(format!(
+                        "runtime state is missing sharded role {role_name}"
+                    ))
+                })?;
+                *status = if completed == task_ids.len() {
+                    CooperativeRoleStatus::Completed(all_outputs)
+                } else {
+                    CooperativeRoleStatus::Sharded {
+                        tasks: task_ids,
+                        completed,
+                    }
+                };
+                job_id
+            }
         };
         self.materialize_ready_roles(job_id)?;
         Ok(())
@@ -697,6 +800,15 @@ impl Fabric {
                         if let Some(status) = job.roles.get_mut(&role_name) {
                             *status = CooperativeRoleStatus::Uncertain;
                         }
+                    }
+                }
+            }
+            TaskRoleBinding::Shard {
+                job_id, role_name, ..
+            } => {
+                if let Some(job) = self.jobs.get_mut(&job_id) {
+                    if let Some(status) = job.roles.get_mut(&role_name) {
+                        *status = CooperativeRoleStatus::Uncertain;
                     }
                 }
             }
@@ -779,6 +891,60 @@ impl Fabric {
                     fusion_chain,
                 } => {
                     let resources = self.schedulable_resources();
+                    if role.shards > 1 {
+                        let Some(selected_shards) = planner::select_ready_shards(
+                            &role,
+                            &dependency_inputs,
+                            &planner::ShardPlanningContext {
+                                scheduler: &self.scheduler,
+                                resources: &resources,
+                                objects: &self.objects,
+                                topology: &self.topology,
+                            },
+                        ) else {
+                            self.jobs
+                                .get_mut(&job_id)
+                                .expect("logical job existence checked above")
+                                .roles
+                                .insert(name, CooperativeRoleStatus::Ready);
+                            continue;
+                        };
+                        let mut task_ids = Vec::with_capacity(selected_shards.len());
+                        let mut selections = Vec::with_capacity(selected_shards.len());
+                        for selected in selected_shards {
+                            let task_id = selected.task.id;
+                            self.submit(selected.task)?;
+                            self.task_roles.insert(
+                                task_id,
+                                TaskRoleBinding::Shard {
+                                    job_id,
+                                    role_name: name.clone(),
+                                },
+                            );
+                            task_ids.push(task_id);
+                            selections.push(ShardSelection {
+                                index: selected.index,
+                                task_id,
+                                implementation: selected.implementation,
+                                planned_resource: selected.resource_id,
+                                estimated_total_ms: selected.cost.total_ms,
+                            });
+                        }
+                        let job = self
+                            .jobs
+                            .get_mut(&job_id)
+                            .expect("logical job existence checked above");
+                        job.roles.insert(
+                            name.clone(),
+                            CooperativeRoleStatus::Sharded {
+                                tasks: task_ids,
+                                completed: 0,
+                            },
+                        );
+                        job.selections
+                            .insert(name, RoleSelection::Sharded(selections));
+                        continue;
+                    }
                     if let Some(selected) = planner::select_ready_fusion(
                         &fusion_chain,
                         &dependency_inputs,
@@ -818,7 +984,7 @@ impl Fabric {
                             );
                             job.selections.insert(
                                 role_name.clone(),
-                                RoleSelection {
+                                RoleSelection::Single {
                                     implementation,
                                     planned_resource: selected.resource_id,
                                     estimated_total_ms: selected.cost.total_ms,
@@ -849,7 +1015,7 @@ impl Fabric {
                             .insert(name, CooperativeRoleStatus::Ready);
                         continue;
                     };
-                    let selection = RoleSelection {
+                    let selection = RoleSelection::Single {
                         implementation: selected.implementation,
                         planned_resource: selected.resource_id,
                         estimated_total_ms: selected.cost.total_ms,
@@ -940,6 +1106,9 @@ fn fusion_chain(
     first: &plurifold_core::LogicalRoleSpec,
 ) -> Vec<plurifold_core::LogicalRoleSpec> {
     let mut chain = vec![first.clone()];
+    if first.shards != 1 {
+        return chain;
+    }
     let mut current = first;
     loop {
         if spec.outputs.contains(&current.name) {
@@ -955,6 +1124,7 @@ fn fusion_chain(
             break;
         };
         if consumers.next().is_some()
+            || consumer.shards != 1
             || consumer.depends_on.as_slice() != [current.name.as_str()]
             || statuses.get(&consumer.name) != Some(&CooperativeRoleStatus::Waiting)
         {
@@ -991,6 +1161,14 @@ fn same_object_identity(left: &ObjectMetadata, right: &ObjectMetadata) -> bool {
 }
 
 fn validate_task(task: &TaskSpec) -> Result<(), FabricError> {
+    if let Some(shard) = &task.shard {
+        if shard.count == 0 || shard.index >= shard.count {
+            return Err(FabricError::InvalidTask(format!(
+                "invalid shard context {}/{}",
+                shard.index, shard.count
+            )));
+        }
+    }
     let Some(pipeline) = &task.pipeline else {
         return Ok(());
     };
@@ -1102,6 +1280,7 @@ mod tests {
             requirements: ResourceRequirements::default(),
             effects,
             cost: CostHint::default(),
+            shard: None,
             pipeline: None,
         }
     }
@@ -1193,6 +1372,7 @@ mod tests {
                         },
                     }],
                     depends_on: vec![],
+                    shards: 1,
                 },
                 LogicalRoleSpec {
                     name: "consumer".into(),
@@ -1215,6 +1395,7 @@ mod tests {
                         },
                     }],
                     depends_on: vec!["producer".into()],
+                    shards: 1,
                 },
             ],
             outputs: vec!["consumer".into()],
@@ -1246,6 +1427,7 @@ mod tests {
                         },
                     }],
                     depends_on: vec![],
+                    shards: 1,
                 },
                 LogicalRoleSpec {
                     name: "middle".into(),
@@ -1268,6 +1450,7 @@ mod tests {
                         },
                     }],
                     depends_on: vec!["producer".into()],
+                    shards: 1,
                 },
                 LogicalRoleSpec {
                     name: "consumer".into(),
@@ -1290,6 +1473,7 @@ mod tests {
                         },
                     }],
                     depends_on: vec!["middle".into()],
+                    shards: 1,
                 },
             ],
             outputs: vec!["consumer".into()],
@@ -1683,16 +1867,19 @@ mod tests {
             name: "producer".into(),
             implementations: vec![logical_implementation("producer", "p", 1.0, 10)],
             depends_on: vec![],
+            shards: 1,
         };
         let first_consumer = LogicalRoleSpec {
             name: "first".into(),
             implementations: vec![logical_implementation("first", "c", 1.0, 1)],
             depends_on: vec!["producer".into()],
+            shards: 1,
         };
         let second_consumer = LogicalRoleSpec {
             name: "second".into(),
             implementations: vec![logical_implementation("second", "c", 1.0, 1)],
             depends_on: vec!["producer".into()],
+            shards: 1,
         };
         let spec = LogicalJobSpec {
             id: JobId::new(),
@@ -2057,6 +2244,7 @@ mod tests {
                         1,
                     )],
                     depends_on: vec![],
+                    shards: 1,
                 }],
                 outputs: vec!["compute".into()],
             })
@@ -2104,6 +2292,7 @@ mod tests {
                         1,
                     )],
                     depends_on: vec![],
+                    shards: 1,
                 },
                 LogicalRoleSpec {
                     name: "join".into(),
@@ -2112,13 +2301,14 @@ mod tests {
                         logical_implementation("fast-new", "join:fast", 10.0, 1),
                     ],
                     depends_on: vec!["root".into()],
+                    shards: 1,
                 },
             ],
             outputs: vec!["join".into()],
         };
 
         let preview = fabric.plan_logical_job(&logical).unwrap();
-        assert_eq!(preview.roles[1].implementation, "slow-left");
+        assert_eq!(preview.roles[1].shards[0].implementation, "slow-left");
         fabric.submit_logical(logical).unwrap();
 
         let root_task = fabric.pending_task_ids()[0];
@@ -2158,5 +2348,244 @@ mod tests {
         assert_eq!(join.implementation.as_deref(), Some("fast-new"));
         assert_eq!(join.planned_resource, Some(newcomer));
         assert!(matches!(join.status, CooperativeRoleStatus::Submitted(_)));
+    }
+
+    #[test]
+    fn sharded_logical_role_fans_out_and_join_waits_for_all_outputs() {
+        let mut fabric = Fabric::default();
+        let workers = [ResourceId::new(), ResourceId::new(), ResourceId::new()];
+        for (index, worker) in workers.iter().copied().enumerate() {
+            let mut descriptor = resource(worker);
+            descriptor.features.insert("shard:work".into());
+            if index == 0 {
+                descriptor.features.insert("join:work".into());
+            }
+            fabric.register_resource(descriptor);
+        }
+        for left in workers {
+            for right in workers {
+                if left != right {
+                    fabric.upsert_link(LinkProfile {
+                        from: left,
+                        to: right,
+                        rtt_ms: 1.0,
+                        bandwidth_mbps: 10_000.0,
+                    });
+                }
+            }
+        }
+
+        let job_id = JobId::new();
+        fabric
+            .submit_logical(LogicalJobSpec {
+                id: job_id,
+                roles: vec![
+                    LogicalRoleSpec {
+                        name: "map".into(),
+                        implementations: vec![logical_implementation(
+                            "map-worker",
+                            "shard:work",
+                            1_000.0,
+                            4,
+                        )],
+                        depends_on: vec![],
+                        shards: 3,
+                    },
+                    LogicalRoleSpec {
+                        name: "join".into(),
+                        implementations: vec![logical_implementation(
+                            "join-worker",
+                            "join:work",
+                            100.0,
+                            12,
+                        )],
+                        depends_on: vec!["map".into()],
+                        shards: 1,
+                    },
+                ],
+                outputs: vec!["join".into()],
+            })
+            .unwrap();
+
+        let initial = fabric.cooperative_role_views(job_id).unwrap();
+        let map = initial.iter().find(|role| role.name == "map").unwrap();
+        let join = initial.iter().find(|role| role.name == "join").unwrap();
+        let task_ids = match &map.status {
+            CooperativeRoleStatus::Sharded { tasks, completed } => {
+                assert_eq!(*completed, 0);
+                tasks.clone()
+            }
+            status => panic!("map role was not sharded: {status:?}"),
+        };
+        assert_eq!(task_ids.len(), 3);
+        assert_eq!(map.shards.len(), 3);
+        assert_eq!(join.status, CooperativeRoleStatus::Waiting);
+        for (index, task_id) in task_ids.iter().copied().enumerate() {
+            assert_eq!(
+                fabric.task_spec(task_id).unwrap().shard,
+                Some(plurifold_core::TaskShard {
+                    index: index as u32,
+                    count: 3,
+                })
+            );
+        }
+
+        let mut leases = Vec::new();
+        let mut leased_resources = HashSet::new();
+        for task_id in &task_ids {
+            let decision = fabric.schedule_task(*task_id).unwrap();
+            leased_resources.insert(decision.resource_id);
+            leases.push(
+                fabric
+                    .begin_execution(*task_id, decision.resource_id)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(leased_resources.len(), 3);
+
+        let output_ids = [ObjectId::new(), ObjectId::new(), ObjectId::new()];
+        for shard_index in [2usize, 0, 1] {
+            let lease = &leases[shard_index];
+            fabric
+                .complete_execution(
+                    lease,
+                    vec![ObjectMetadata {
+                        id: output_ids[shard_index],
+                        size_bytes: 4,
+                        digest: Some(format!("sha256:shard-{shard_index}")),
+                        encoding: None,
+                        locations: vec![lease.resource_id],
+                        producer: Some(lease.task_id),
+                    }],
+                )
+                .unwrap();
+
+            let roles = fabric.cooperative_role_views(job_id).unwrap();
+            let map = roles.iter().find(|role| role.name == "map").unwrap();
+            let join = roles.iter().find(|role| role.name == "join").unwrap();
+            if shard_index != 1 {
+                assert!(matches!(map.status, CooperativeRoleStatus::Sharded { .. }));
+                assert_eq!(join.status, CooperativeRoleStatus::Waiting);
+            }
+        }
+
+        let roles = fabric.cooperative_role_views(job_id).unwrap();
+        let map = roles.iter().find(|role| role.name == "map").unwrap();
+        let join = roles.iter().find(|role| role.name == "join").unwrap();
+        assert_eq!(
+            map.status,
+            CooperativeRoleStatus::Completed(output_ids.to_vec())
+        );
+        let join_task = match join.status {
+            CooperativeRoleStatus::Submitted(task_id) => task_id,
+            ref status => panic!("join did not materialize after all shards: {status:?}"),
+        };
+        assert_eq!(
+            fabric.task_spec(join_task).unwrap().inputs,
+            output_ids.to_vec()
+        );
+    }
+
+    #[test]
+    fn replay_safe_shard_expiry_keeps_the_role_running() {
+        let mut fabric = Fabric::new(10_000, 100);
+        let worker = ResourceId::new();
+        let mut descriptor = resource(worker);
+        descriptor.features.insert("shard:retry".into());
+        fabric.register_resource(descriptor);
+        let job_id = JobId::new();
+        fabric
+            .submit_logical(LogicalJobSpec {
+                id: job_id,
+                roles: vec![LogicalRoleSpec {
+                    name: "map".into(),
+                    implementations: vec![logical_implementation(
+                        "retry-worker",
+                        "shard:retry",
+                        100.0,
+                        1,
+                    )],
+                    depends_on: vec![],
+                    shards: 2,
+                }],
+                outputs: vec!["map".into()],
+            })
+            .unwrap();
+        let map = fabric.cooperative_role_views(job_id).unwrap().remove(0);
+        let task_ids = match map.status {
+            CooperativeRoleStatus::Sharded { tasks, .. } => tasks,
+            status => panic!("map role was not sharded: {status:?}"),
+        };
+        let lease = fabric.begin_execution(task_ids[0], worker).unwrap();
+        fabric.reap_expired_executions_at(lease.expires_at_unix_ms);
+        assert_eq!(fabric.task_status(task_ids[0]), Some(&TaskStatus::Pending));
+        let map = fabric.cooperative_role_views(job_id).unwrap().remove(0);
+        assert!(matches!(
+            map.status,
+            CooperativeRoleStatus::Sharded { completed: 0, .. }
+        ));
+        assert_eq!(
+            fabric.cooperative_job_status(job_id),
+            Some(CooperativeJobStatus::Running)
+        );
+    }
+
+    #[test]
+    fn exclusive_shard_expiry_marks_the_whole_role_uncertain() {
+        let mut fabric = Fabric::new(10_000, 100);
+        let worker = ResourceId::new();
+        let mut descriptor = resource(worker);
+        descriptor.features.insert("shard:exclusive".into());
+        fabric.register_resource(descriptor);
+        let mut implementation =
+            logical_implementation("exclusive-worker", "shard:exclusive", 100.0, 1);
+        implementation.task.effects = EffectSemantics::Exclusive;
+        let job_id = JobId::new();
+        fabric
+            .submit_logical(LogicalJobSpec {
+                id: job_id,
+                roles: vec![LogicalRoleSpec {
+                    name: "map".into(),
+                    implementations: vec![implementation],
+                    depends_on: vec![],
+                    shards: 2,
+                }],
+                outputs: vec!["map".into()],
+            })
+            .unwrap();
+        let map = fabric.cooperative_role_views(job_id).unwrap().remove(0);
+        let task_ids = match map.status {
+            CooperativeRoleStatus::Sharded { tasks, .. } => tasks,
+            status => panic!("map role was not sharded: {status:?}"),
+        };
+        let lease = fabric.begin_execution(task_ids[0], worker).unwrap();
+        fabric.reap_expired_executions_at(lease.expires_at_unix_ms);
+        assert_eq!(
+            fabric.cooperative_role_views(job_id).unwrap()[0].status,
+            CooperativeRoleStatus::Uncertain
+        );
+        assert_eq!(
+            fabric.cooperative_job_status(job_id),
+            Some(CooperativeJobStatus::Uncertain)
+        );
+
+        let sibling_lease = fabric.begin_execution(task_ids[1], worker).unwrap();
+        fabric
+            .complete_execution(
+                &sibling_lease,
+                vec![ObjectMetadata {
+                    id: ObjectId::new(),
+                    size_bytes: 1,
+                    digest: Some("sha256:sibling-after-uncertain".into()),
+                    encoding: None,
+                    locations: vec![worker],
+                    producer: Some(task_ids[1]),
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            fabric.cooperative_role_views(job_id).unwrap()[0].status,
+            CooperativeRoleStatus::Uncertain
+        );
     }
 }

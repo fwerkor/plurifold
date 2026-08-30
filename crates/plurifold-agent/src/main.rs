@@ -14,7 +14,7 @@ use axum::{Json, Router};
 use clap::{Parser, Subcommand};
 use plurifold_core::{
     Architecture, MembershipLease, ObjectId, ObjectMetadata, PipelineInput, ResourceDescriptor,
-    ResourceId, TaskPipeline, TaskSpec,
+    ResourceId, TaskPipeline, TaskShard, TaskSpec,
 };
 use plurifold_protocol::{
     CompleteExecutionRequest, ErrorResponse, HeartbeatRequest, LinkMeasurement, PutObjectResponse,
@@ -548,12 +548,19 @@ async fn materialize_input(
 
 async fn execute_task(task: &TaskSpec, inputs: &[Vec<u8>]) -> Result<Vec<u8>, String> {
     match &task.pipeline {
-        Some(pipeline) => execute_pipeline(pipeline, inputs).await,
-        None => execute_builtin_operation(&task.artifact, &task.arguments, inputs).await,
+        Some(pipeline) => execute_pipeline(pipeline, inputs, task.shard.as_ref()).await,
+        None => {
+            execute_builtin_operation(&task.artifact, &task.arguments, inputs, task.shard.as_ref())
+                .await
+        }
     }
 }
 
-async fn execute_pipeline(pipeline: &TaskPipeline, inputs: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+async fn execute_pipeline(
+    pipeline: &TaskPipeline,
+    inputs: &[Vec<u8>],
+    shard: Option<&TaskShard>,
+) -> Result<Vec<u8>, String> {
     if pipeline.stages.len() < 2 {
         return Err("task pipeline requires at least two stages".to_owned());
     }
@@ -577,7 +584,8 @@ async fn execute_pipeline(pipeline: &TaskPipeline, inputs: &[Vec<u8>]) -> Result
             }
         }
         previous = Some(
-            execute_builtin_operation(&stage.artifact, &stage.arguments, &stage_inputs).await?,
+            execute_builtin_operation(&stage.artifact, &stage.arguments, &stage_inputs, shard)
+                .await?,
         );
     }
     previous.ok_or_else(|| "task pipeline produced no output".to_owned())
@@ -587,6 +595,7 @@ async fn execute_builtin_operation(
     artifact: &str,
     arguments: &[String],
     inputs: &[Vec<u8>],
+    shard: Option<&TaskShard>,
 ) -> Result<Vec<u8>, String> {
     match artifact {
         "builtin:identity" => inputs
@@ -595,6 +604,27 @@ async fn execute_builtin_operation(
             .ok_or_else(|| "builtin:identity requires one input".to_owned()),
         "builtin:concat" => Ok(inputs.iter().flatten().copied().collect()),
         "builtin:echo" => Ok(arguments.join(" ").into_bytes()),
+        "builtin:shard-echo" => {
+            let shard =
+                shard.ok_or_else(|| "builtin:shard-echo requires shard context".to_owned())?;
+            let prefix = arguments.join(" ");
+            Ok(format!("{prefix}:{}:{}", shard.index, shard.count).into_bytes())
+        }
+        "builtin:shard-sleep" => {
+            let shard =
+                shard.ok_or_else(|| "builtin:shard-sleep requires shard context".to_owned())?;
+            let millis = arguments
+                .first()
+                .ok_or_else(|| "builtin:shard-sleep requires milliseconds".to_owned())?
+                .parse::<u64>()
+                .map_err(|_| "builtin:shard-sleep milliseconds must be an integer".to_owned())?;
+            let prefix = arguments
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "shard".to_owned());
+            tokio::time::sleep(Duration::from_millis(millis)).await;
+            Ok(format!("{prefix}:{}:{}", shard.index, shard.count).into_bytes())
+        }
         "builtin:sleep" => {
             let millis = arguments
                 .first()
@@ -803,11 +833,31 @@ mod tests {
                     },
                 ],
             }),
+
+            shard: None,
         };
 
         let output = execute_task(&task, &[b"left".to_vec(), b"right".to_vec(), b"!".to_vec()])
             .await
             .unwrap();
         assert_eq!(output, b"leftright!");
+    }
+    #[tokio::test]
+    async fn shard_echo_observes_task_shard_context() {
+        let task = TaskSpec {
+            id: TaskId::new(),
+            artifact: "builtin:shard-echo".into(),
+            entrypoint: "run".into(),
+            arguments: vec!["piece".into()],
+            inputs: vec![],
+            requirements: ResourceRequirements::default(),
+            effects: EffectSemantics::Pure,
+            cost: CostHint::default(),
+            shard: Some(TaskShard { index: 1, count: 3 }),
+            pipeline: None,
+        };
+
+        let output = execute_task(&task, &[]).await.unwrap();
+        assert_eq!(output, b"piece:1:3");
     }
 }

@@ -174,7 +174,15 @@ pub struct TaskSpec {
     pub effects: EffectSemantics,
     pub cost: CostHint,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard: Option<TaskShard>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline: Option<TaskPipeline>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TaskShard {
+    pub index: u32,
+    pub count: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -224,6 +232,7 @@ impl TaskTemplate {
             requirements: self.requirements.clone(),
             effects: self.effects.clone(),
             cost: self.cost.clone(),
+            shard: None,
             pipeline: None,
         }
     }
@@ -258,6 +267,14 @@ pub struct LogicalRoleSpec {
     pub implementations: Vec<RoleImplementation>,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Number of independent contributions required for this logical role. Each shard receives the
+    /// same logical inputs plus a TaskShard { index, count } context. Cost hints are per shard.
+    #[serde(default = "default_role_shards")]
+    pub shards: u32,
+}
+
+const fn default_role_shards() -> u32 {
+    1
 }
 
 /// A higher-level cooperative computation whose role boundaries are declared by the application or
