@@ -29,7 +29,7 @@ Cooperative Job
 
 ### Logical planner
 
-A `LogicalJobSpec` keeps the role/dependency graph explicit but allows each role to advertise multiple Task implementations. A snapshot planner can preview a concrete `CooperativeJobSpec`, but v0.7 logical execution keeps the alternatives live instead of treating that preview as the execution contract.
+A `LogicalJobSpec` keeps the role/dependency graph explicit but allows each role to advertise multiple Task implementations. A snapshot planner can preview a concrete `CooperativeJobSpec`, but v0.8 logical execution keeps the alternatives live instead of treating that preview as the execution contract.
 
 For each ready role it scores implementation/resource pairs with the ordinary topology-aware scheduler. Predicted predecessor outputs are represented as temporary planning objects located at the chosen predecessor resources, with size derived from the selected implementation's output-size hint. This lets a downstream choice account for the communication cost created by upstream choices instead of selecting every role independently.
 
@@ -39,14 +39,16 @@ For `auto-submit`, a role is normally concretized only when all of its predecess
 
 ### Graph runtime
 
-The runtime tracks dependencies and may perform semantics-preserving transformations. v0.7 implements the first production transformation: look-ahead fusion of a two-role linear chain. Before a logical producer is submitted, the runtime may inspect its sole consumer, compare separate execution paths against a same-resource coarse task, and materialize one `TaskPipeline` when measured transfer cost makes the edge communication-sensitive and the fused task is not worse under the current model.
+The runtime tracks dependencies and may perform semantics-preserving transformations. v0.8 extends look-ahead coarsening from one producer/consumer pair to a variable-length safe linear chain. Before a ready logical role is submitted, the runtime follows sole-consumer edges while every next role depends only on its predecessor and no interior role is a declared job output. It then evaluates each fusible prefix rather than forcing the maximal chain into one task.
 
-The v0.7 safety envelope is intentionally strict: both roles must expose only Pure builtin-family implementations; the producer cannot be an externally visible job output or have another consumer; the consumer must depend only on that producer; and their resource requirements must be representable by one combined requirement set. A fused task retains one normal execution lease. Its intermediate bytes are passed between pipeline stages in agent memory and are not published as an Object; only the final consumer output is published. Job status keeps both logical roles and records the fusion relationship and cost estimates.
+The placement model is used end to end. A stage-wise dynamic program estimates the best fully separate execution of the maximal chain. For each candidate fused prefix, Plurifold scores the same-resource `TaskPipeline` and then predicts the best separate placement of any remaining suffix. The selected prefix maximizes modeled whole-chain savings, with avoided transfer and longer chains used only as tie-breakers. A locally attractive fusion is therefore rejected when it would make the later suffix more expensive overall.
+
+The safety envelope remains strict: every fused role must expose only Pure builtin-family implementations, interior fused roles cannot be declared job outputs or fan out, each next fused role must depend only on its predecessor, and the selected implementations' resource requirements must be representable by one combined requirement set. A non-fusible tail may remain outside an otherwise valid fused prefix. One fused chain keeps one normal execution lease; internal stage bytes stay in agent memory, and only the last fused stage publishes an Object. Job status preserves every logical role and records the ordered fusion group and stage index.
 
 Other graph transformations remain research work:
 
 - task batching;
-- N-stage/general-DAG producer/consumer fusion;
+- general-DAG fan-out/fan-in fusion;
 - speculative replication;
 - checkpoint insertion;
 - migration at checkpoint boundaries;
@@ -103,7 +105,7 @@ The topology model classifies links by observed RTT/bandwidth rather than admini
 
 These thresholds are policy defaults, not correctness rules. Runtime measurements can override them.
 
-In v0.7 the link graph is maintained from active peer probes rather than requiring topology to be injected manually. Agents measure peer RTT and bounded practical HTTP throughput in the background without blocking heartbeats or work polling. Failed probes withdraw automatic links. Explicit operator links remain authoritative overrides. The same measured links now also drive the first graph-coarsening decision. This still assumes the advertised peer endpoints are directly routable; relay/NAT traversal is a separate transport problem.
+In v0.8 the link graph is maintained from active peer probes rather than requiring topology to be injected manually. Agents measure peer RTT and bounded practical HTTP throughput in the background without blocking heartbeats or work polling. Failed probes withdraw automatic links. Explicit operator links remain authoritative overrides. The same measured links now also drive the first graph-coarsening decision. This still assumes the advertised peer endpoints are directly routable; relay/NAT traversal is a separate transport problem.
 
 ## 4. Control plane vs data plane
 

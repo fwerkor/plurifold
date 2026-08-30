@@ -5,7 +5,7 @@ use plurifold_core::{
 use plurifold_runtime::{CooperativeJobStatus, CooperativePlan, CooperativeRoleView, TaskStatus};
 use serde::{Deserialize, Serialize};
 
-pub const API_VERSION: u32 = 3;
+pub const API_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RegisterResourceRequest {

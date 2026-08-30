@@ -792,13 +792,22 @@ mod tests {
                             PipelineInput::External { index: 1 },
                         ],
                     },
+                    TaskPipelineStage {
+                        artifact: "builtin:concat".into(),
+                        entrypoint: "run".into(),
+                        arguments: vec![],
+                        inputs: vec![
+                            PipelineInput::PreviousOutput,
+                            PipelineInput::External { index: 2 },
+                        ],
+                    },
                 ],
             }),
         };
 
-        let output = execute_task(&task, &[b"left".to_vec(), b"right".to_vec()])
+        let output = execute_task(&task, &[b"left".to_vec(), b"right".to_vec(), b"!".to_vec()])
             .await
             .unwrap();
-        assert_eq!(output, b"leftright");
+        assert_eq!(output, b"leftright!");
     }
 }

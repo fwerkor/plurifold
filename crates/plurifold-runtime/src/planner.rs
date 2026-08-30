@@ -71,8 +71,7 @@ pub(crate) struct ReadyRoleSelection {
 }
 
 pub(crate) struct ReadyFusionSelection {
-    pub producer_implementation: String,
-    pub consumer_implementation: String,
+    pub implementations: Vec<String>,
     pub task: TaskSpec,
     pub resource_id: ResourceId,
     pub cost: PlacementBreakdown,
@@ -80,17 +79,26 @@ pub(crate) struct ReadyFusionSelection {
     pub estimated_vs_separate_ms: f64,
 }
 
-#[derive(Clone, Copy)]
-struct SeparatePath {
-    producer_resource: ResourceId,
-    consumer_resource: ResourceId,
-    intermediate_bytes: u64,
+#[derive(Clone)]
+struct SeparateChainState {
+    implementation_index: usize,
+    resource_id: ResourceId,
+    output_bytes: u64,
     total_ms: f64,
+    cross_transfer_ms: f64,
+    has_cross_resource_edge: bool,
+    has_fusion_trigger_edge: bool,
 }
 
-struct SeparatePaths {
-    best: SeparatePath,
-    best_cross_resource: Option<SeparatePath>,
+struct SeparateChainPaths {
+    best: SeparateChainState,
+    best_cross_resource: Option<SeparateChainState>,
+}
+
+struct FusedImplementationChoice {
+    names: Vec<String>,
+    tasks: Vec<TaskTemplate>,
+    requirements: ResourceRequirements,
 }
 
 pub(crate) struct FusionContext<'a> {
@@ -134,48 +142,36 @@ pub(crate) fn select_ready_role(
 }
 
 pub(crate) fn select_ready_fusion(
-    producer: &plurifold_core::LogicalRoleSpec,
-    producer_dependency_inputs: &[ObjectId],
-    consumer: &plurifold_core::LogicalRoleSpec,
+    chain: &[plurifold_core::LogicalRoleSpec],
+    dependency_inputs: &[ObjectId],
     context: &FusionContext<'_>,
 ) -> Option<ReadyFusionSelection> {
-    if !producer
-        .implementations
+    let fusable_prefix_len = chain
         .iter()
-        .all(|implementation| fusable_template(&implementation.task))
-        || !consumer
-            .implementations
-            .iter()
-            .all(|implementation| fusable_template(&implementation.task))
-    {
-        return None;
-    }
-    let separate = separate_paths(producer, producer_dependency_inputs, consumer, context)?;
-    let cross_resource = separate.best_cross_resource.as_ref()?;
-    let link = context.topology.link(
-        cross_resource.producer_resource,
-        cross_resource.consumer_resource,
-    )?;
-    let recommendation = context
-        .advisor
-        .evaluate(cross_resource.intermediate_bytes, link);
-    if !recommendation.should_fuse {
+        .take_while(|role| {
+            role.implementations
+                .iter()
+                .all(|implementation| fusable_template(&implementation.task))
+        })
+        .count();
+    if fusable_prefix_len < 2 {
         return None;
     }
 
+    let full_separate = separate_chain_paths(chain, dependency_inputs, context)?;
     let mut best: Option<ReadyFusionSelection> = None;
-    for producer_impl in &producer.implementations {
-        let producer_task = producer_impl
-            .task
-            .instantiate(producer_dependency_inputs.iter().copied());
-        for consumer_impl in &consumer.implementations {
-            let Some(requirements) = combine_requirements(
-                &producer_impl.task.requirements,
-                &consumer_impl.task.requirements,
-            ) else {
-                continue;
-            };
-            let task = fused_pipeline_task(&producer_task, &consumer_impl.task, requirements);
+    for prefix_len in 2..=fusable_prefix_len {
+        let prefix = &chain[..prefix_len];
+        let separate = separate_chain_paths(prefix, dependency_inputs, context)?;
+        let Some(cross_resource) = separate.best_cross_resource.as_ref() else {
+            continue;
+        };
+        if !cross_resource.has_fusion_trigger_edge {
+            continue;
+        }
+
+        for choice in fused_implementation_choices(prefix) {
+            let task = fused_pipeline_task(&choice.tasks, dependency_inputs, choice.requirements);
             let Ok(decision) = context.scheduler.choose(
                 &task,
                 context.resources,
@@ -184,108 +180,273 @@ pub(crate) fn select_ready_fusion(
             ) else {
                 continue;
             };
-            let estimated_vs_separate_ms = separate.best.total_ms - decision.cost.total_ms;
+            let projected_total_ms = if prefix_len == chain.len() {
+                decision.cost.total_ms
+            } else {
+                let Some(projected) = best_chain_tail_total(
+                    &chain[prefix_len..],
+                    choice
+                        .tasks
+                        .last()
+                        .expect("fusion prefix has at least two tasks")
+                        .cost
+                        .output_bytes,
+                    decision.resource_id,
+                    decision.cost.total_ms,
+                    context,
+                ) else {
+                    continue;
+                };
+                projected
+            };
+            let estimated_vs_separate_ms = full_separate.best.total_ms - projected_total_ms;
             if estimated_vs_separate_ms < 0.0 {
                 continue;
             }
-            let replace = best
-                .as_ref()
-                .map(|current| decision.cost.total_ms < current.cost.total_ms)
-                .unwrap_or(true);
-            if replace {
-                best = Some(ReadyFusionSelection {
-                    producer_implementation: producer_impl.name.clone(),
-                    consumer_implementation: consumer_impl.name.clone(),
-                    task,
-                    resource_id: decision.resource_id,
-                    cost: decision.cost,
-                    estimated_avoided_transfer_ms: recommendation.estimated_saved_transfer_ms,
-                    estimated_vs_separate_ms,
-                });
+            let candidate = ReadyFusionSelection {
+                implementations: choice.names,
+                task,
+                resource_id: decision.resource_id,
+                cost: decision.cost,
+                estimated_avoided_transfer_ms: cross_resource.cross_transfer_ms,
+                estimated_vs_separate_ms,
+            };
+            if fusion_candidate_is_better(&candidate, best.as_ref()) {
+                best = Some(candidate);
             }
         }
     }
     best
 }
 
-fn separate_paths(
-    producer: &plurifold_core::LogicalRoleSpec,
-    producer_dependency_inputs: &[ObjectId],
-    consumer: &plurifold_core::LogicalRoleSpec,
+fn best_chain_tail_total(
+    tail: &[plurifold_core::LogicalRoleSpec],
+    previous_output_bytes: u64,
+    previous_resource: ResourceId,
+    initial_total_ms: f64,
     context: &FusionContext<'_>,
-) -> Option<SeparatePaths> {
-    let mut best: Option<SeparatePath> = None;
-    let mut best_cross_resource: Option<SeparatePath> = None;
-    for producer_impl in &producer.implementations {
-        let producer_task = producer_impl
+) -> Option<f64> {
+    let seed = SeparateChainState {
+        implementation_index: usize::MAX,
+        resource_id: previous_resource,
+        output_bytes: previous_output_bytes,
+        total_ms: initial_total_ms,
+        cross_transfer_ms: 0.0,
+        has_cross_resource_edge: false,
+        has_fusion_trigger_edge: false,
+    };
+    let mut states = HashMap::from([((usize::MAX, previous_resource, false, false), seed)]);
+    for role in tail {
+        states = advance_chain_states(states, role, context)?;
+    }
+    states
+        .into_values()
+        .map(|state| state.total_ms)
+        .min_by(f64::total_cmp)
+}
+
+fn fusion_candidate_is_better(
+    candidate: &ReadyFusionSelection,
+    current: Option<&ReadyFusionSelection>,
+) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+    match candidate
+        .estimated_vs_separate_ms
+        .total_cmp(&current.estimated_vs_separate_ms)
+    {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        Ordering::Equal => match candidate
+            .estimated_avoided_transfer_ms
+            .total_cmp(&current.estimated_avoided_transfer_ms)
+        {
+            Ordering::Greater => true,
+            Ordering::Less => false,
+            Ordering::Equal => candidate.implementations.len() > current.implementations.len(),
+        },
+    }
+}
+
+fn separate_chain_paths(
+    chain: &[plurifold_core::LogicalRoleSpec],
+    dependency_inputs: &[ObjectId],
+    context: &FusionContext<'_>,
+) -> Option<SeparateChainPaths> {
+    let first = chain.first()?;
+    let mut states = HashMap::<(usize, ResourceId, bool, bool), SeparateChainState>::new();
+    for (implementation_index, implementation) in first.implementations.iter().enumerate() {
+        let task = implementation
             .task
-            .instantiate(producer_dependency_inputs.iter().copied());
-        for producer_resource in context.resources {
-            let Some(producer_cost) = placement_cost(
+            .instantiate(dependency_inputs.iter().copied());
+        for resource in context.resources {
+            let Some(cost) = placement_cost(
                 context.scheduler,
-                &producer_task,
-                producer_resource,
+                &task,
+                resource,
                 context.objects,
                 context.topology,
             ) else {
                 continue;
             };
-            let intermediate = ObjectId::new();
-            let mut predicted_objects = context.objects.clone();
-            predicted_objects.insert(
-                intermediate,
-                ObjectMetadata {
-                    id: intermediate,
-                    size_bytes: producer_impl.task.cost.output_bytes,
-                    digest: None,
-                    encoding: None,
-                    locations: vec![producer_resource.id],
-                    producer: None,
-                },
-            );
-            for consumer_impl in &consumer.implementations {
-                let consumer_task = consumer_impl.task.instantiate([intermediate]);
-                for consumer_resource in context.resources {
-                    let Some(consumer_cost) = placement_cost(
-                        context.scheduler,
-                        &consumer_task,
-                        consumer_resource,
-                        &predicted_objects,
-                        context.topology,
-                    ) else {
-                        continue;
-                    };
-                    let total_ms = producer_cost.total_ms + consumer_cost.total_ms;
-                    let candidate = SeparatePath {
-                        producer_resource: producer_resource.id,
-                        consumer_resource: consumer_resource.id,
-                        intermediate_bytes: producer_impl.task.cost.output_bytes,
-                        total_ms,
-                    };
-                    let replace = best
-                        .as_ref()
-                        .map(|current| total_ms < current.total_ms)
-                        .unwrap_or(true);
-                    if replace {
-                        best = Some(candidate);
-                    }
-                    if candidate.producer_resource != candidate.consumer_resource {
-                        let replace_cross = best_cross_resource
-                            .as_ref()
-                            .map(|current| candidate.total_ms < current.total_ms)
-                            .unwrap_or(true);
-                        if replace_cross {
-                            best_cross_resource = Some(candidate);
-                        }
-                    }
-                }
-            }
+            let state = SeparateChainState {
+                implementation_index,
+                resource_id: resource.id,
+                output_bytes: implementation.task.cost.output_bytes,
+                total_ms: cost.total_ms,
+                cross_transfer_ms: 0.0,
+                has_cross_resource_edge: false,
+                has_fusion_trigger_edge: false,
+            };
+            insert_better_chain_state(&mut states, state);
         }
     }
-    best.map(|best| SeparatePaths {
+    if states.is_empty() {
+        return None;
+    }
+
+    for role in chain.iter().skip(1) {
+        states = advance_chain_states(states, role, context)?;
+    }
+
+    let best = states
+        .values()
+        .min_by(|left, right| left.total_ms.total_cmp(&right.total_ms))?
+        .clone();
+    let best_cross_resource = states
+        .values()
+        .filter(|state| state.has_cross_resource_edge)
+        .min_by(|left, right| left.total_ms.total_cmp(&right.total_ms))
+        .cloned();
+    Some(SeparateChainPaths {
         best,
         best_cross_resource,
     })
+}
+
+fn advance_chain_states(
+    states: HashMap<(usize, ResourceId, bool, bool), SeparateChainState>,
+    role: &plurifold_core::LogicalRoleSpec,
+    context: &FusionContext<'_>,
+) -> Option<HashMap<(usize, ResourceId, bool, bool), SeparateChainState>> {
+    let mut next_states = HashMap::<(usize, ResourceId, bool, bool), SeparateChainState>::new();
+    for previous in states.into_values() {
+        let intermediate = ObjectId::new();
+        let mut predicted_objects = context.objects.clone();
+        predicted_objects.insert(
+            intermediate,
+            ObjectMetadata {
+                id: intermediate,
+                size_bytes: previous.output_bytes,
+                digest: None,
+                encoding: None,
+                locations: vec![previous.resource_id],
+                producer: None,
+            },
+        );
+        for (implementation_index, implementation) in role.implementations.iter().enumerate() {
+            let task = implementation.task.instantiate([intermediate]);
+            for resource in context.resources {
+                let Some(cost) = placement_cost(
+                    context.scheduler,
+                    &task,
+                    resource,
+                    &predicted_objects,
+                    context.topology,
+                ) else {
+                    continue;
+                };
+                let mut cross_transfer_ms = previous.cross_transfer_ms;
+                let mut has_cross_resource_edge = previous.has_cross_resource_edge;
+                let mut has_fusion_trigger_edge = previous.has_fusion_trigger_edge;
+                if previous.resource_id != resource.id {
+                    let link = context.topology.link(previous.resource_id, resource.id)?;
+                    let recommendation = context.advisor.evaluate(previous.output_bytes, link);
+                    cross_transfer_ms += recommendation.estimated_saved_transfer_ms;
+                    has_cross_resource_edge = true;
+                    has_fusion_trigger_edge |= recommendation.should_fuse;
+                }
+                insert_better_chain_state(
+                    &mut next_states,
+                    SeparateChainState {
+                        implementation_index,
+                        resource_id: resource.id,
+                        output_bytes: implementation.task.cost.output_bytes,
+                        total_ms: previous.total_ms + cost.total_ms,
+                        cross_transfer_ms,
+                        has_cross_resource_edge,
+                        has_fusion_trigger_edge,
+                    },
+                );
+            }
+        }
+    }
+    (!next_states.is_empty()).then_some(next_states)
+}
+
+fn insert_better_chain_state(
+    states: &mut HashMap<(usize, ResourceId, bool, bool), SeparateChainState>,
+    candidate: SeparateChainState,
+) {
+    let key = (
+        candidate.implementation_index,
+        candidate.resource_id,
+        candidate.has_cross_resource_edge,
+        candidate.has_fusion_trigger_edge,
+    );
+    let replace = states
+        .get(&key)
+        .map(|current| {
+            candidate.total_ms < current.total_ms
+                || (candidate.total_ms == current.total_ms
+                    && candidate.cross_transfer_ms > current.cross_transfer_ms)
+        })
+        .unwrap_or(true);
+    if replace {
+        states.insert(key, candidate);
+    }
+}
+
+fn fused_implementation_choices(
+    chain: &[plurifold_core::LogicalRoleSpec],
+) -> Vec<FusedImplementationChoice> {
+    let mut choices = Vec::<FusedImplementationChoice>::new();
+    let Some(first) = chain.first() else {
+        return choices;
+    };
+    for implementation in &first.implementations {
+        choices.push(FusedImplementationChoice {
+            names: vec![implementation.name.clone()],
+            tasks: vec![implementation.task.clone()],
+            requirements: implementation.task.requirements.clone(),
+        });
+    }
+    for role in chain.iter().skip(1) {
+        let previous = std::mem::take(&mut choices);
+        for choice in previous {
+            for implementation in &role.implementations {
+                let Some(requirements) =
+                    combine_requirements(&choice.requirements, &implementation.task.requirements)
+                else {
+                    continue;
+                };
+                let mut names = choice.names.clone();
+                names.push(implementation.name.clone());
+                let mut tasks = choice.tasks.clone();
+                tasks.push(implementation.task.clone());
+                choices.push(FusedImplementationChoice {
+                    names,
+                    tasks,
+                    requirements,
+                });
+            }
+        }
+        if choices.is_empty() {
+            break;
+        }
+    }
+    choices
 }
 
 fn fusable_template(task: &TaskTemplate) -> bool {
@@ -338,23 +499,37 @@ fn combine_accelerator(
 }
 
 fn fused_pipeline_task(
-    producer: &TaskSpec,
-    consumer: &TaskTemplate,
+    tasks: &[TaskTemplate],
+    dependency_inputs: &[ObjectId],
     requirements: ResourceRequirements,
 ) -> TaskSpec {
+    let first = tasks
+        .first()
+        .expect("fusion selection requires at least two stages")
+        .instantiate(dependency_inputs.iter().copied());
     let mut external_inputs = Vec::<ObjectId>::new();
     let mut external_indexes = HashMap::<ObjectId, usize>::new();
-    let producer_inputs = pipeline_external_bindings(
-        &producer.inputs,
-        &mut external_inputs,
-        &mut external_indexes,
-    );
-    let mut consumer_inputs = pipeline_external_bindings(
-        &consumer.inputs,
-        &mut external_inputs,
-        &mut external_indexes,
-    );
-    consumer_inputs.push(PipelineInput::PreviousOutput);
+    let first_inputs =
+        pipeline_external_bindings(&first.inputs, &mut external_inputs, &mut external_indexes);
+
+    let mut stages = Vec::with_capacity(tasks.len());
+    stages.push(TaskPipelineStage {
+        artifact: first.artifact,
+        entrypoint: first.entrypoint,
+        arguments: first.arguments,
+        inputs: first_inputs,
+    });
+    for task in tasks.iter().skip(1) {
+        let mut inputs =
+            pipeline_external_bindings(&task.inputs, &mut external_inputs, &mut external_indexes);
+        inputs.push(PipelineInput::PreviousOutput);
+        stages.push(TaskPipelineStage {
+            artifact: task.artifact.clone(),
+            entrypoint: task.entrypoint.clone(),
+            arguments: task.arguments.clone(),
+            inputs,
+        });
+    }
 
     TaskSpec {
         id: TaskId::new(),
@@ -365,26 +540,13 @@ fn fused_pipeline_task(
         requirements,
         effects: EffectSemantics::Pure,
         cost: plurifold_core::CostHint {
-            compute_ms_on_reference: producer.cost.compute_ms_on_reference
-                + consumer.cost.compute_ms_on_reference,
-            output_bytes: consumer.cost.output_bytes,
+            compute_ms_on_reference: tasks
+                .iter()
+                .map(|task| task.cost.compute_ms_on_reference)
+                .sum(),
+            output_bytes: tasks.last().map(|task| task.cost.output_bytes).unwrap_or(0),
         },
-        pipeline: Some(TaskPipeline {
-            stages: vec![
-                TaskPipelineStage {
-                    artifact: producer.artifact.clone(),
-                    entrypoint: producer.entrypoint.clone(),
-                    arguments: producer.arguments.clone(),
-                    inputs: producer_inputs,
-                },
-                TaskPipelineStage {
-                    artifact: consumer.artifact.clone(),
-                    entrypoint: consumer.entrypoint.clone(),
-                    arguments: consumer.arguments.clone(),
-                    inputs: consumer_inputs,
-                },
-            ],
-        }),
+        pipeline: Some(TaskPipeline { stages }),
     }
 }
 

@@ -121,6 +121,78 @@ write_fusion_job() {
 JSON
 }
 
+write_chain_fusion_job() {
+  local file=$1
+  local middle_output_bytes=$2
+  local final_compute_ms=$3
+  cat >"$file" <<JSON
+{
+  "roles": [
+    {
+      "name": "producer",
+      "implementations": [{
+        "name": "producer-builtin",
+        "task": {
+          "artifact": "builtin:sleep",
+          "entrypoint": "run",
+          "arguments": ["600"],
+          "requirements": {
+            "architecture": null,
+            "min_memory_bytes": 0,
+            "accelerator": null,
+            "required_features": ["fusion:producer"]
+          },
+          "effects": "Pure",
+          "cost": {"compute_ms_on_reference": 100.0, "output_bytes": 17179869184}
+        }
+      }],
+      "depends_on": []
+    },
+    {
+      "name": "middle",
+      "implementations": [{
+        "name": "middle-builtin",
+        "task": {
+          "artifact": "builtin:identity",
+          "entrypoint": "run",
+          "requirements": {
+            "architecture": null,
+            "min_memory_bytes": 0,
+            "accelerator": null,
+            "required_features": ["fusion:middle"]
+          },
+          "effects": "Pure",
+          "cost": {"compute_ms_on_reference": 100.0, "output_bytes": $middle_output_bytes}
+        }
+      }],
+      "depends_on": ["producer"]
+    },
+    {
+      "name": "consumer",
+      "implementations": [{
+        "name": "consumer-builtin",
+        "task": {
+          "artifact": "builtin:echo",
+          "entrypoint": "run",
+          "arguments": ["chain-final"],
+          "requirements": {
+            "architecture": null,
+            "min_memory_bytes": 0,
+            "accelerator": null,
+            "required_features": ["fusion:consumer"]
+          },
+          "effects": "Pure",
+          "cost": {"compute_ms_on_reference": $final_compute_ms, "output_bytes": 4}
+        }
+      }],
+      "depends_on": ["middle"]
+    }
+  ],
+  "outputs": ["consumer"]
+}
+JSON
+}
+
 cargo build --workspace --quiet
 
 ./target/debug/plurifold-coordinator \
@@ -138,6 +210,7 @@ wait_http "$COORD/healthz"
   --performance 2 \
   --feature demo:role-left \
   --feature fusion:producer \
+  --feature fusion:middle \
   --feature fusion:consumer \
   --coordinator "$COORD" \
   --bind "127.0.0.1:${A_PORT}" \
@@ -485,6 +558,7 @@ done
   --name worker-c \
   --performance 20 \
   --feature demo:join-fast \
+  --feature fusion:middle \
   --feature fusion:consumer \
   --coordinator "$COORD" \
   --bind "127.0.0.1:${C_PORT}" \
@@ -572,7 +646,9 @@ data=json.load(sys.stdin)
 roles={role["name"]:role for role in data["roles"]}
 producer=roles["producer"]
 consumer=roles["consumer"]
-assert producer["fusion"]["peer_role"] == "consumer", producer
+assert producer["fusion"]["chain_roles"] == ["producer", "consumer"], producer
+assert producer["fusion"]["stage_index"] == 0, producer
+assert consumer["fusion"]["stage_index"] == 1, consumer
 assert producer["fusion"]["estimated_avoided_transfer_ms"] > 20, producer
 assert producer["fusion"]["estimated_vs_separate_ms"] >= 0, producer
 assert producer["planned_resource"] == sys.argv[1], producer
@@ -589,6 +665,82 @@ assert len(pipeline["stages"]) == 2, pipeline
 FUSION_EXPECTED=$(printf 'done' | sha256sum | awk '{print $1}')
 [[ -f "$TMP/a/sha256/$FUSION_EXPECTED" ]]
 echo "graph-fusion: high-cost edge fused into one task on worker-a"
+
+write_chain_fusion_job "$TMP/chain-fusion-full.json" 17179869184 100
+CHAIN_FUSION_JOB=$(./target/debug/plurifold job auto-submit \
+  --coordinator "$COORD" --file "$TMP/chain-fusion-full.json")
+CHAIN_PRODUCER_TASK=""
+CHAIN_MIDDLE_TASK=""
+CHAIN_CONSUMER_TASK=""
+for _ in $(seq 1 100); do
+  CHAIN_FUSION_VIEW=$(./target/debug/plurifold job status \
+    --coordinator "$COORD" --job "$CHAIN_FUSION_JOB")
+  CHAIN_PRODUCER_TASK=$(printf '%s' "$CHAIN_FUSION_VIEW" | json_role_task producer)
+  CHAIN_MIDDLE_TASK=$(printf '%s' "$CHAIN_FUSION_VIEW" | json_role_task middle)
+  CHAIN_CONSUMER_TASK=$(printf '%s' "$CHAIN_FUSION_VIEW" | json_role_task consumer)
+  if [[ -n "$CHAIN_PRODUCER_TASK" && -n "$CHAIN_MIDDLE_TASK" && -n "$CHAIN_CONSUMER_TASK" ]]; then
+    break
+  fi
+  sleep 0.02
+done
+[[ -n "$CHAIN_PRODUCER_TASK" ]]
+[[ "$CHAIN_PRODUCER_TASK" == "$CHAIN_MIDDLE_TASK" ]]
+[[ "$CHAIN_PRODUCER_TASK" == "$CHAIN_CONSUMER_TASK" ]]
+printf '%s' "$CHAIN_FUSION_VIEW" | python3 -c 'import json,sys
+data=json.load(sys.stdin)
+roles={role["name"]:role for role in data["roles"]}
+expected=["producer", "middle", "consumer"]
+for index,name in enumerate(expected):
+    fusion=roles[name]["fusion"]
+    assert fusion["chain_roles"] == expected, (name, fusion)
+    assert fusion["stage_index"] == index, (name, fusion)
+    assert roles[name]["planned_resource"] == sys.argv[1], roles[name]
+' "$A_ID"
+CHAIN_FUSION_TASK_VIEW=$(./target/debug/plurifold status \
+  --coordinator "$COORD" --task "$CHAIN_PRODUCER_TASK")
+printf '%s' "$CHAIN_FUSION_TASK_VIEW" | python3 -c 'import json,sys
+pipeline=json.load(sys.stdin)["task"]["pipeline"]
+assert len(pipeline["stages"]) == 3, pipeline
+'
+./target/debug/plurifold job wait \
+  --coordinator "$COORD" --job "$CHAIN_FUSION_JOB" --timeout-s 10 >/dev/null
+CHAIN_EXPECTED=$(printf 'chain-final' | sha256sum | awk '{print $1}')
+[[ -f "$TMP/a/sha256/$CHAIN_EXPECTED" ]]
+echo "graph-chain-fusion: three-stage chain fused into one task on worker-a"
+
+write_chain_fusion_job "$TMP/chain-fusion-prefix.json" 1 10000
+PREFIX_FUSION_JOB=$(./target/debug/plurifold job auto-submit \
+  --coordinator "$COORD" --file "$TMP/chain-fusion-prefix.json")
+PREFIX_PRODUCER_TASK=""
+PREFIX_MIDDLE_TASK=""
+for _ in $(seq 1 100); do
+  PREFIX_FUSION_VIEW=$(./target/debug/plurifold job status \
+    --coordinator "$COORD" --job "$PREFIX_FUSION_JOB")
+  PREFIX_PRODUCER_TASK=$(printf '%s' "$PREFIX_FUSION_VIEW" | json_role_task producer)
+  PREFIX_MIDDLE_TASK=$(printf '%s' "$PREFIX_FUSION_VIEW" | json_role_task middle)
+  if [[ -n "$PREFIX_PRODUCER_TASK" && -n "$PREFIX_MIDDLE_TASK" ]]; then
+    break
+  fi
+  sleep 0.02
+done
+[[ -n "$PREFIX_PRODUCER_TASK" && "$PREFIX_PRODUCER_TASK" == "$PREFIX_MIDDLE_TASK" ]]
+printf '%s' "$PREFIX_FUSION_VIEW" | python3 -c 'import json,sys
+data=json.load(sys.stdin)
+roles={role["name"]:role for role in data["roles"]}
+expected=["producer", "middle"]
+assert roles["producer"]["fusion"]["chain_roles"] == expected, roles["producer"]
+assert roles["middle"]["fusion"]["chain_roles"] == expected, roles["middle"]
+assert roles["consumer"]["status"] == "Waiting", roles["consumer"]
+'
+PREFIX_FUSION_TASK_VIEW=$(./target/debug/plurifold status \
+  --coordinator "$COORD" --task "$PREFIX_PRODUCER_TASK")
+printf '%s' "$PREFIX_FUSION_TASK_VIEW" | python3 -c 'import json,sys
+pipeline=json.load(sys.stdin)["task"]["pipeline"]
+assert len(pipeline["stages"]) == 2, pipeline
+'
+./target/debug/plurifold job wait \
+  --coordinator "$COORD" --job "$PREFIX_FUSION_JOB" --timeout-s 10 >/dev/null
+echo "graph-chain-prefix: expensive tail kept outside the two-stage fused prefix"
 
 kill "$C_PID"
 C_PID=0

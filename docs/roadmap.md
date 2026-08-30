@@ -53,7 +53,8 @@
 - [x] active RTT/bandwidth probing
 - [x] peer link graph maintenance and latency domains from live measurements
 - [x] topology-driven safe linear producer/consumer fusion with in-memory intermediate handoff
-- [ ] N-stage/general-DAG fusion and automatic batching
+- [x] adaptive multi-stage linear-chain fusion with end-to-end prefix-cost selection
+- [ ] general-DAG fan-out/fan-in fusion and automatic batching
 - [ ] speculative replication
 - [ ] checkpoint-aware migration
 - [ ] policy simulator and trace replay
