@@ -2,15 +2,18 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use plurifold_core::{
-    AcceleratorRequirement, Architecture, EffectSemantics, LogicalJobSpec, ObjectId,
-    ObjectMetadata, PipelineInput, ResourceDescriptor, ResourceId, ResourceRequirements, TaskId,
-    TaskPipeline, TaskPipelineStage, TaskShard, TaskSpec, TaskTemplate, TopologySnapshot,
+    AcceleratorRequirement, Architecture, AutoShardPolicy, EffectSemantics, LogicalJobSpec,
+    ObjectId, ObjectMetadata, PipelineInput, ResourceDescriptor, ResourceId, ResourceRequirements,
+    ShardPartitionSpec, ShardPolicy, ShardPolicySpec, TaskId, TaskPipeline, TaskPipelineStage,
+    TaskShard, TaskShardPartition, TaskSpec, TaskTemplate, TopologySnapshot,
 };
 use plurifold_scheduler::{
     FusionAdvisor, PlacementBreakdown, ScheduleError, TopologyAwareScheduler,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+const MAX_AUTO_SHARDS: u32 = 256;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlannedPlacement {
@@ -29,6 +32,8 @@ pub struct PlannedPlacement {
 pub struct PlannedShard {
     pub index: u32,
     pub implementation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<TaskShardPartition>,
     pub placement: PlannedPlacement,
 }
 
@@ -158,20 +163,106 @@ pub(crate) fn select_ready_shards(
     context: &ShardPlanningContext<'_>,
 ) -> Option<Vec<ReadyShardSelection>> {
     let mut availability = HashMap::<ResourceId, f64>::new();
-    choose_shards(
-        role,
-        dependency_inputs,
-        role.shards,
-        0.0,
-        &mut availability,
-        context,
-    )
+    choose_role_shards(role, dependency_inputs, 0.0, &mut availability, context)
+}
+
+fn choose_role_shards(
+    role: &plurifold_core::LogicalRoleSpec,
+    dependency_inputs: &[ObjectId],
+    dependency_ready_ms: f64,
+    resource_available_ms: &mut HashMap<ResourceId, f64>,
+    context: &ShardPlanningContext<'_>,
+) -> Option<Vec<ReadyShardSelection>> {
+    match &role.shards {
+        ShardPolicy::Fixed(count) => choose_shards(
+            role,
+            dependency_inputs,
+            *count,
+            None,
+            dependency_ready_ms,
+            resource_available_ms,
+            context,
+        ),
+        ShardPolicy::Policy(ShardPolicySpec::Auto(policy)) => choose_auto_shards(
+            role,
+            dependency_inputs,
+            policy,
+            dependency_ready_ms,
+            resource_available_ms,
+            context,
+        ),
+    }
+}
+
+fn choose_auto_shards(
+    role: &plurifold_core::LogicalRoleSpec,
+    dependency_inputs: &[ObjectId],
+    policy: &AutoShardPolicy,
+    dependency_ready_ms: f64,
+    resource_available_ms: &mut HashMap<ResourceId, f64>,
+    context: &ShardPlanningContext<'_>,
+) -> Option<Vec<ReadyShardSelection>> {
+    let partition_bytes = partition_object_size(role, &policy.partition, context.objects)?;
+    let max_shards = if partition_bytes == 0 {
+        1
+    } else {
+        policy
+            .max_shards
+            .min(partition_bytes.min(u32::MAX as u64) as u32)
+    };
+    let base_availability = resource_available_ms.clone();
+    let mut best: Option<(Vec<ReadyShardSelection>, HashMap<ResourceId, f64>, f64)> = None;
+
+    for count in 1..=max_shards {
+        let mut candidate_availability = base_availability.clone();
+        let Some(selections) = choose_shards(
+            role,
+            dependency_inputs,
+            count,
+            Some(policy),
+            dependency_ready_ms,
+            &mut candidate_availability,
+            context,
+        ) else {
+            continue;
+        };
+        let finish_ms = selections
+            .iter()
+            .map(|selection| selection.start_ms + selection.cost.total_ms)
+            .fold(dependency_ready_ms, f64::max);
+        let incremental_ms = (finish_ms - dependency_ready_ms).max(0.0);
+        let replace = best
+            .as_ref()
+            .map(|(current, _, current_incremental)| {
+                match incremental_ms.total_cmp(current_incremental) {
+                    Ordering::Less => {
+                        let gain_ratio = if *current_incremental <= 0.0 {
+                            0.0
+                        } else {
+                            (*current_incremental - incremental_ms) / *current_incremental
+                        };
+                        gain_ratio >= policy.min_gain_ratio
+                    }
+                    Ordering::Equal => selections.len() < current.len(),
+                    Ordering::Greater => false,
+                }
+            })
+            .unwrap_or(true);
+        if replace {
+            best = Some((selections, candidate_availability, incremental_ms));
+        }
+    }
+
+    let (selections, availability, _) = best?;
+    *resource_available_ms = availability;
+    Some(selections)
 }
 
 fn choose_shards(
     role: &plurifold_core::LogicalRoleSpec,
     dependency_inputs: &[ObjectId],
     shard_count: u32,
+    auto_policy: Option<&AutoShardPolicy>,
     dependency_ready_ms: f64,
     resource_available_ms: &mut HashMap<ResourceId, f64>,
     context: &ShardPlanningContext<'_>,
@@ -180,13 +271,14 @@ fn choose_shards(
     for index in 0..shard_count {
         let mut best: Option<ReadyShardSelection> = None;
         for implementation in &role.implementations {
-            let mut task = implementation
-                .task
-                .instantiate(dependency_inputs.iter().copied());
-            task.shard = Some(TaskShard {
+            let task = instantiate_shard_task(
+                &implementation.task,
+                dependency_inputs,
                 index,
-                count: shard_count,
-            });
+                shard_count,
+                auto_policy,
+                context.objects,
+            )?;
             for resource in context.resources {
                 let Some(cost) = placement_cost(
                     context.scheduler,
@@ -234,6 +326,111 @@ fn choose_shards(
         selections.push(selected);
     }
     Some(selections)
+}
+
+fn instantiate_shard_task(
+    template: &TaskTemplate,
+    dependency_inputs: &[ObjectId],
+    index: u32,
+    count: u32,
+    auto_policy: Option<&AutoShardPolicy>,
+    objects: &HashMap<ObjectId, ObjectMetadata>,
+) -> Option<TaskSpec> {
+    let mut task = template.instantiate(dependency_inputs.iter().copied());
+    let partition = match auto_policy {
+        Some(policy) => Some(concrete_partition(
+            template,
+            &policy.partition,
+            index,
+            count,
+            objects,
+        )?),
+        None => None,
+    };
+    if let Some(policy) = auto_policy {
+        scale_auto_shard_cost(&mut task, partition.as_ref()?, policy);
+    }
+    task.shard = Some(TaskShard {
+        index,
+        count,
+        partition,
+    });
+    Some(task)
+}
+
+fn partition_object_size(
+    role: &plurifold_core::LogicalRoleSpec,
+    partition: &ShardPartitionSpec,
+    objects: &HashMap<ObjectId, ObjectMetadata>,
+) -> Option<u64> {
+    let template = &role.implementations.first()?.task;
+    let object_id = partition_object_id(template, partition)?;
+    Some(objects.get(&object_id)?.size_bytes)
+}
+
+fn partition_object_id(
+    template: &TaskTemplate,
+    partition: &ShardPartitionSpec,
+) -> Option<ObjectId> {
+    match partition {
+        ShardPartitionSpec::ByteRange { input } => template.inputs.get(*input).copied(),
+    }
+}
+
+fn concrete_partition(
+    template: &TaskTemplate,
+    partition: &ShardPartitionSpec,
+    index: u32,
+    count: u32,
+    objects: &HashMap<ObjectId, ObjectMetadata>,
+) -> Option<TaskShardPartition> {
+    match partition {
+        ShardPartitionSpec::ByteRange { input } => {
+            let object_id = template.inputs.get(*input)?;
+            let total_bytes = objects.get(object_id)?.size_bytes;
+            let (offset, length) = partition_bounds(total_bytes, index, count);
+            Some(TaskShardPartition::ByteRange {
+                input: *input,
+                offset,
+                length,
+                total_bytes,
+            })
+        }
+    }
+}
+
+fn partition_bounds(total: u64, index: u32, count: u32) -> (u64, u64) {
+    let start = (total as u128 * index as u128 / count as u128) as u64;
+    let end = (total as u128 * (index + 1) as u128 / count as u128) as u64;
+    (start, end - start)
+}
+
+fn scale_auto_shard_cost(
+    task: &mut TaskSpec,
+    partition: &TaskShardPartition,
+    policy: &AutoShardPolicy,
+) {
+    let TaskShardPartition::ByteRange {
+        offset,
+        length,
+        total_bytes,
+        ..
+    } = partition;
+    let fraction = if *total_bytes == 0 {
+        1.0
+    } else {
+        *length as f64 / *total_bytes as f64
+    };
+    task.cost.compute_ms_on_reference =
+        task.cost.compute_ms_on_reference * fraction + policy.per_shard_overhead_ms;
+    if *total_bytes == 0 {
+        return;
+    }
+    let output_start =
+        (task.cost.output_bytes as u128 * *offset as u128 / *total_bytes as u128) as u64;
+    let output_end = (task.cost.output_bytes as u128 * (*offset + *length) as u128
+        / *total_bytes as u128) as u64;
+    task.cost.output_bytes = output_end - output_start;
 }
 
 pub(crate) fn select_ready_fusion(
@@ -720,10 +917,9 @@ pub(crate) fn plan(
             .map(|dependency| selected[dependency].finish_ms)
             .fold(0.0_f64, f64::max);
 
-        let Some(shards) = choose_shards(
+        let Some(shards) = choose_role_shards(
             role,
             &dependency_inputs,
-            role.shards,
             dependency_ready_ms,
             &mut resource_available_ms,
             &ShardPlanningContext {
@@ -758,6 +954,11 @@ pub(crate) fn plan(
             planned_shards.push(PlannedShard {
                 index: shard.index,
                 implementation: shard.implementation,
+                partition: shard
+                    .task
+                    .shard
+                    .as_ref()
+                    .and_then(|shard| shard.partition.clone()),
                 placement: PlannedPlacement {
                     resource_id: shard.resource_id,
                     start_ms: shard.start_ms,
@@ -856,17 +1057,67 @@ pub(crate) fn validate_logical_job(spec: &LogicalJobSpec) -> Result<(), PlanErro
     .map_err(PlanError::InvalidLogicalJob)?;
 
     for role in &spec.roles {
-        if role.shards == 0 {
-            return Err(PlanError::InvalidLogicalJob(format!(
-                "role {} must request at least one shard",
-                role.name
-            )));
+        match &role.shards {
+            ShardPolicy::Fixed(0) => {
+                return Err(PlanError::InvalidLogicalJob(format!(
+                    "role {} must request at least one shard",
+                    role.name
+                )));
+            }
+            ShardPolicy::Policy(ShardPolicySpec::Auto(policy)) => {
+                if policy.max_shards == 0 || policy.max_shards > MAX_AUTO_SHARDS {
+                    return Err(PlanError::InvalidLogicalJob(format!(
+                        "role {} auto max_shards must be between 1 and {MAX_AUTO_SHARDS}",
+                        role.name
+                    )));
+                }
+                if !policy.per_shard_overhead_ms.is_finite() || policy.per_shard_overhead_ms < 0.0 {
+                    return Err(PlanError::InvalidLogicalJob(format!(
+                        "role {} auto per_shard_overhead_ms must be finite and non-negative",
+                        role.name
+                    )));
+                }
+                if !policy.min_gain_ratio.is_finite()
+                    || policy.min_gain_ratio < 0.0
+                    || policy.min_gain_ratio >= 1.0
+                {
+                    return Err(PlanError::InvalidLogicalJob(format!(
+                        "role {} auto min_gain_ratio must be in [0, 1)",
+                        role.name
+                    )));
+                }
+            }
+            ShardPolicy::Fixed(_) => {}
         }
         if role.implementations.is_empty() {
             return Err(PlanError::InvalidLogicalJob(format!(
                 "role {} has no implementations",
                 role.name
             )));
+        }
+        if let Some(policy) = role.shards.auto() {
+            let input_index = match policy.partition {
+                ShardPartitionSpec::ByteRange { input } => input,
+            };
+            let expected_input = role.implementations[0]
+                .task
+                .inputs
+                .get(input_index)
+                .copied()
+                .ok_or_else(|| {
+                    PlanError::InvalidLogicalJob(format!(
+                        "role {} auto partition input {} is not an explicit TaskTemplate input",
+                        role.name, input_index
+                    ))
+                })?;
+            if role.implementations.iter().any(|implementation| {
+                implementation.task.inputs.get(input_index).copied() != Some(expected_input)
+            }) {
+                return Err(PlanError::InvalidLogicalJob(format!(
+                    "role {} auto partition input {} must reference the same Object across implementations",
+                    role.name, input_index
+                )));
+            }
         }
         let mut implementation_names = HashSet::with_capacity(role.implementations.len());
         for implementation in &role.implementations {
@@ -961,8 +1212,8 @@ mod tests {
     use std::collections::{BTreeSet, HashMap};
 
     use plurifold_core::{
-        Architecture, CostHint, EffectSemantics, LinkProfile, LogicalRoleSpec,
-        ResourceRequirements, RoleImplementation,
+        Architecture, AutoShardPolicy, CostHint, EffectSemantics, LinkProfile, LogicalRoleSpec,
+        ResourceRequirements, RoleImplementation, ShardPartitionSpec, ShardPolicy, ShardPolicySpec,
     };
 
     use super::*;
@@ -1022,7 +1273,7 @@ mod tests {
                     implementation("accelerator", "backend:accel", 1_000.0, 1),
                 ],
                 depends_on: vec![],
-                shards: 1,
+                shards: 1.into(),
             }],
             outputs: vec!["compute".into()],
         };
@@ -1059,7 +1310,7 @@ mod tests {
                         100 << 20,
                     )],
                     depends_on: vec![],
-                    shards: 1,
+                    shards: 1.into(),
                 },
                 LogicalRoleSpec {
                     name: "small".into(),
@@ -1070,7 +1321,7 @@ mod tests {
                         1 << 20,
                     )],
                     depends_on: vec![],
-                    shards: 1,
+                    shards: 1.into(),
                 },
                 LogicalRoleSpec {
                     name: "join".into(),
@@ -1079,7 +1330,7 @@ mod tests {
                         implementation("join-right", "site:right", 100.0, 1),
                     ],
                     depends_on: vec!["large".into(), "small".into()],
-                    shards: 1,
+                    shards: 1.into(),
                 },
             ],
             outputs: vec!["join".into()],
@@ -1133,7 +1384,7 @@ mod tests {
                 },
             }],
             depends_on: vec![],
-            shards: 1,
+            shards: 1.into(),
         };
         let logical = LogicalJobSpec {
             id: Default::default(),
@@ -1172,7 +1423,7 @@ mod tests {
                 name: "map".into(),
                 implementations: vec![implementation("worker", "shard:work", 1_000.0, 4)],
                 depends_on: vec![],
-                shards: 3,
+                shards: 3.into(),
             }],
             outputs: vec!["map".into()],
         };
@@ -1214,7 +1465,7 @@ mod tests {
                     implementation("accelerator", "backend:accel", 1_000.0, 4),
                 ],
                 depends_on: vec![],
-                shards: 2,
+                shards: 2.into(),
             }],
             outputs: vec!["map".into()],
         };
@@ -1239,5 +1490,161 @@ mod tests {
         assert_eq!(shards[1].placement.resource_id, accelerator);
         assert_eq!(shards[0].placement.start_ms, 0.0);
         assert_eq!(shards[1].placement.start_ms, 0.0);
+    }
+
+    #[test]
+    fn auto_sharding_selects_two_workers_and_concrete_byte_ranges() {
+        let first = ResourceId::new();
+        let second = ResourceId::new();
+        let input = ObjectId::new();
+        let role = LogicalRoleSpec {
+            name: "map".into(),
+            implementations: vec![RoleImplementation {
+                name: "worker".into(),
+                task: TaskTemplate {
+                    artifact: "builtin:identity".into(),
+                    entrypoint: "run".into(),
+                    arguments: vec![],
+                    inputs: vec![input],
+                    requirements: ResourceRequirements {
+                        required_features: BTreeSet::from(["auto:work".into()]),
+                        ..ResourceRequirements::default()
+                    },
+                    effects: EffectSemantics::Pure,
+                    cost: CostHint {
+                        compute_ms_on_reference: 2_000.0,
+                        output_bytes: 1_000,
+                    },
+                },
+            }],
+            depends_on: vec![],
+            shards: ShardPolicy::Policy(ShardPolicySpec::Auto(AutoShardPolicy {
+                max_shards: 4,
+                partition: ShardPartitionSpec::ByteRange { input: 0 },
+                per_shard_overhead_ms: 0.0,
+                min_gain_ratio: 0.05,
+            })),
+        };
+        let objects = HashMap::from([(
+            input,
+            ObjectMetadata {
+                id: input,
+                size_bytes: 1_000,
+                digest: None,
+                encoding: None,
+                locations: vec![first],
+                producer: None,
+            },
+        )]);
+        let resources = [
+            resource(first, 1.0, "auto:work"),
+            resource(second, 1.0, "auto:work"),
+        ];
+        let topology = TopologySnapshot {
+            links: vec![LinkProfile {
+                from: first,
+                to: second,
+                rtt_ms: 0.1,
+                bandwidth_mbps: 10_000.0,
+            }],
+        };
+        let context = ShardPlanningContext {
+            scheduler: &TopologyAwareScheduler::default(),
+            resources: &resources,
+            objects: &objects,
+            topology: &topology,
+        };
+        let shards = select_ready_shards(&role, &[], &context).unwrap();
+        assert_eq!(shards.len(), 2);
+        assert_ne!(shards[0].resource_id, shards[1].resource_id);
+        assert_eq!(shards[0].task.cost.compute_ms_on_reference, 1_000.0);
+        assert_eq!(shards[1].task.cost.compute_ms_on_reference, 1_000.0);
+        assert_eq!(shards[0].task.cost.output_bytes, 500);
+        assert_eq!(shards[1].task.cost.output_bytes, 500);
+        assert_eq!(
+            shards[0].task.shard.as_ref().unwrap().partition,
+            Some(TaskShardPartition::ByteRange {
+                input: 0,
+                offset: 0,
+                length: 500,
+                total_bytes: 1_000,
+            })
+        );
+        assert_eq!(
+            shards[1].task.shard.as_ref().unwrap().partition,
+            Some(TaskShardPartition::ByteRange {
+                input: 0,
+                offset: 500,
+                length: 500,
+                total_bytes: 1_000,
+            })
+        );
+    }
+
+    #[test]
+    fn auto_sharding_stays_single_when_remote_topology_is_too_expensive() {
+        let local = ResourceId::new();
+        let remote = ResourceId::new();
+        let input = ObjectId::new();
+        let role = LogicalRoleSpec {
+            name: "map".into(),
+            implementations: vec![RoleImplementation {
+                name: "worker".into(),
+                task: TaskTemplate {
+                    artifact: "builtin:identity".into(),
+                    entrypoint: "run".into(),
+                    arguments: vec![],
+                    inputs: vec![input],
+                    requirements: ResourceRequirements {
+                        required_features: BTreeSet::from(["auto:work".into()]),
+                        ..ResourceRequirements::default()
+                    },
+                    effects: EffectSemantics::Pure,
+                    cost: CostHint {
+                        compute_ms_on_reference: 100.0,
+                        output_bytes: 1_000,
+                    },
+                },
+            }],
+            depends_on: vec![],
+            shards: ShardPolicy::Policy(ShardPolicySpec::Auto(AutoShardPolicy {
+                max_shards: 4,
+                partition: ShardPartitionSpec::ByteRange { input: 0 },
+                per_shard_overhead_ms: 0.0,
+                min_gain_ratio: 0.05,
+            })),
+        };
+        let objects = HashMap::from([(
+            input,
+            ObjectMetadata {
+                id: input,
+                size_bytes: 1_000,
+                digest: None,
+                encoding: None,
+                locations: vec![local],
+                producer: None,
+            },
+        )]);
+        let resources = [
+            resource(local, 1.0, "auto:work"),
+            resource(remote, 1.0, "auto:work"),
+        ];
+        let topology = TopologySnapshot {
+            links: vec![LinkProfile {
+                from: local,
+                to: remote,
+                rtt_ms: 500.0,
+                bandwidth_mbps: 1.0,
+            }],
+        };
+        let context = ShardPlanningContext {
+            scheduler: &TopologyAwareScheduler::default(),
+            resources: &resources,
+            objects: &objects,
+            topology: &topology,
+        };
+        let shards = select_ready_shards(&role, &[], &context).unwrap();
+        assert_eq!(shards.len(), 1);
+        assert_eq!(shards[0].resource_id, local);
     }
 }

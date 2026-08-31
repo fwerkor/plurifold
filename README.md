@@ -50,7 +50,7 @@ Resource fabric
 
 ## Repository status
 
-The repository now contains a **v0.9 networked research prototype**, not only a design scaffold:
+The repository now contains a **v0.10 networked research prototype**, not only a design scaffold:
 
 - typed Resource, Task, Object, Topology, membership-lease, and execution-lease models;
 - a topology-aware placement cost model;
@@ -59,8 +59,10 @@ The repository now contains a **v0.9 networked research prototype**, not only a 
 - renewable work leases for long-running tasks;
 - cooperative jobs whose independent roles can execute concurrently on different resources and whose dependent roles consume predecessor outputs;
 - a logical-job planner that previews per-role/per-shard implementation and resource choices using capabilities, compute cost, input locality, predicted intermediate transfers, topology, and predicted resource availability;
-- explicit sharded logical roles: `shards: N` expands one logical role into N ordinary child Tasks that can run concurrently on different Resources and are aggregated before dependent roles become ready;
+- fixed and automatic sharded logical roles: numeric `shards: N` preserves explicit independent contributions, while auto mode can choose a byte-range shard count from current resources and topology;
 - deterministic fan-in: shard outputs are exposed to downstream roles in shard-index order even when child Tasks complete out of order;
+- concrete byte-range partitioning for auto roles: child Tasks receive disjoint contiguous ranges, scheduler transfer cost uses only range bytes, and remote agents fetch only those ranges over HTTP;
+- bounded automatic parallelism: the planner evaluates candidate counts, heterogeneous implementation/resource choices, declared per-child overhead, and a minimum modeled makespan gain before adding shards;
 - dynamic ready-time replanning: `auto-submit` keeps implementation alternatives live and chooses a role's concrete Task only after its real predecessor Objects exist, using the then-current resources and topology;
 - automatic peer topology discovery: agents measure RTT plus bounded practical HTTP throughput, report reachability to the coordinator, refresh links periodically, and withdraw automatic links when probes fail;
 - topology-driven graph coarsening for safe linear logical-role chains: the runtime discovers a maximal single-successor/single-dependency chain and can fuse a cost-optimal Pure builtin-family prefix into one multi-stage `TaskPipeline`;
@@ -71,9 +73,9 @@ The repository now contains a **v0.9 networked research prototype**, not only a 
 - replay-safe retry after worker loss, with non-replay-safe tasks entering `Uncertain`;
 - a small builtin executor (`identity`, `concat`, `echo`, `sleep`, plus shard-observation test operations) used to exercise the runtime without hiding unimplemented portability behind a fake generic executor;
 - a CLI for object publication, task/cooperative-job submission, planner preview/auto-submit, resource inspection, and manual topology overrides;
-- a multi-process E2E test that verifies direct peer transfer, explicit cooperative execution, hot-join-driven implementation replanning, one logical role fanning out concurrently across three Agents and joining its outputs, low-cost no-fusion, two- and three-stage fusion, adaptive prefix stopping, cross-resource joins, and takeover after worker loss.
+- a multi-process E2E test that verifies direct peer transfer, explicit cooperative execution, hot-join-driven replanning, fixed fan-out, automatic three-Agent byte-range fan-out with partial remote fetches and exact reconstruction, graph fusion/coarsening, cross-resource joins, and takeover after worker loss.
 
-Still intentionally missing: authentication/TLS, durable coordinator state, native/WASI sandboxed executors, accelerator adapters, automatic data partitioning or shard-count selection, arbitrary general-DAG fusion/batching, speculative replication/migration, and production-grade observability.
+Still intentionally missing: authentication/TLS, durable coordinator state, native/WASI sandboxed executors, accelerator adapters, record/tensor-aware partitioners, hierarchical/quorum reductions, arbitrary general-DAG fusion/batching, speculative replication/migration, and production-grade observability.
 
 ## Quick start
 
@@ -137,9 +139,27 @@ cargo run -p plurifold-cli -- job auto-submit \
 
 `job plan` is a snapshot preview. `job auto-submit` instead stores the `LogicalJobSpec` and replans work when dependencies actually complete. A ready role with no currently feasible implementation stays `Ready` and is retried as resources/topology change.
 
-A logical role may set `shards: N` (default `1`). Plurifold then creates N ordinary child Tasks. Every child receives the same logical Object inputs plus `TaskShard { index, count }`; the application/executor uses that context to decide which portion of work the shard represents. Cost hints are per shard. The planner predicts per-shard implementation/resource choices and resource availability, so shards spread across idle Resources when that reduces makespan and reuse Resources serially when capacity is smaller than the requested shard count. Downstream roles wait for all shard Tasks and receive their output Objects in shard-index order. Plurifold does not claim to infer the partition or choose N automatically.
+A logical role may still set `shards: N` (default `1`). That fixed form preserves the previous numeric-shard contract: N independent contributions receive the same logical inputs, `TaskShard { index, count }` identifies each contribution, and cost hints are per child.
 
-For unsharded roles, v0.9 retains adaptive linear-chain fusion: it follows the maximal safe linear chain and evaluates each fusible prefix against projected whole-chain cost. Sharded roles are explicit graph boundaries and are not absorbed into a fused `TaskPipeline`. Role boundaries are still declared by the application or a domain library; predicted resources remain advisory rather than hard bindings, and lease-time scheduling is authoritative.
+For work whose partition semantics really are contiguous raw bytes, v0.10 also accepts an automatic policy:
+
+```json
+"shards": {
+  "mode": "auto",
+  "max_shards": 8,
+  "partition": {"kind": "byte_range", "input": 0},
+  "per_shard_overhead_ms": 2.0,
+  "min_gain_ratio": 0.05
+}
+```
+
+The partition input must be an explicit `TaskTemplate.inputs` Object and the same Object across implementation alternatives. In auto mode the template compute/output hints describe the single-shard total; Plurifold scales them by each byte fraction, adds the declared per-child overhead, evaluates shard counts from 1 through the configured bound, and only accepts additional parallelism when the modeled incremental role makespan improves enough. Concrete ranges are visible in `job plan` and live job status.
+
+Remote agents issue HTTP Range requests and verify a SHA-256 digest for the returned range; partial bytes are never registered as a full Object replica. A local agent that already owns the complete Object slices it locally. Downstream roles still wait for all children and consume their outputs in shard-index order.
+
+This is deliberately a byte contract, not semantic data understanding. Plurifold does not infer JSON-record boundaries, tensor axes, training samples, or arbitrary program decomposition. Domain-aware partitioners and hierarchical reductions remain future work.
+
+For unsharded roles, v0.10 retains adaptive linear-chain fusion. Fixed multi-shard and auto-sharded roles are explicit graph boundaries and are not absorbed into a fused `TaskPipeline`. Predicted resources remain advisory rather than hard bindings, and lease-time scheduling is authoritative.
 
 ## Design invariants
 

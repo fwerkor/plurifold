@@ -3,8 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use plurifold_core::{
     CooperativeJobSpec, ExecutionId, ExecutionLease, JobDefinition, JobId, LogicalJobSpec,
-    MembershipLease, ObjectId, ObjectMetadata, ResourceDescriptor, ResourceId, TaskId, TaskSpec,
-    TopologySnapshot,
+    MembershipLease, ObjectId, ObjectMetadata, ResourceDescriptor, ResourceId, TaskId,
+    TaskShardPartition, TaskSpec, TopologySnapshot,
 };
 use plurifold_scheduler::{
     FusionAdvisor, PlacementDecision, ScheduleError, TopologyAwareScheduler,
@@ -66,6 +66,8 @@ pub struct RoleShardView {
     pub implementation: String,
     pub planned_resource: ResourceId,
     pub estimated_total_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<TaskShardPartition>,
     pub status: TaskStatus,
 }
 
@@ -451,18 +453,24 @@ impl Fabric {
                                 None,
                                 selections
                                     .iter()
-                                    .map(|selection| RoleShardView {
-                                        index: selection.index,
-                                        task_id: selection.task_id,
-                                        implementation: selection.implementation.clone(),
-                                        planned_resource: selection.planned_resource,
-                                        estimated_total_ms: selection.estimated_total_ms,
-                                        status: self
+                                    .map(|selection| {
+                                        let task = self
                                             .tasks
                                             .get(&selection.task_id)
-                                            .expect("selected shard task exists")
-                                            .status
-                                            .clone(),
+                                            .expect("selected shard task exists");
+                                        RoleShardView {
+                                            index: selection.index,
+                                            task_id: selection.task_id,
+                                            implementation: selection.implementation.clone(),
+                                            planned_resource: selection.planned_resource,
+                                            estimated_total_ms: selection.estimated_total_ms,
+                                            partition: task
+                                                .spec
+                                                .shard
+                                                .as_ref()
+                                                .and_then(|shard| shard.partition.clone()),
+                                            status: task.status.clone(),
+                                        }
                                     })
                                     .collect(),
                             ),
@@ -891,7 +899,7 @@ impl Fabric {
                     fusion_chain,
                 } => {
                     let resources = self.schedulable_resources();
-                    if role.shards > 1 {
+                    if role.shards.may_fan_out() {
                         let Some(selected_shards) = planner::select_ready_shards(
                             &role,
                             &dependency_inputs,
@@ -1106,7 +1114,7 @@ fn fusion_chain(
     first: &plurifold_core::LogicalRoleSpec,
 ) -> Vec<plurifold_core::LogicalRoleSpec> {
     let mut chain = vec![first.clone()];
-    if first.shards != 1 {
+    if first.shards.fixed_count() != Some(1) {
         return chain;
     }
     let mut current = first;
@@ -1124,7 +1132,7 @@ fn fusion_chain(
             break;
         };
         if consumers.next().is_some()
-            || consumer.shards != 1
+            || consumer.shards.fixed_count() != Some(1)
             || consumer.depends_on.as_slice() != [current.name.as_str()]
             || statuses.get(&consumer.name) != Some(&CooperativeRoleStatus::Waiting)
         {
@@ -1167,6 +1175,22 @@ fn validate_task(task: &TaskSpec) -> Result<(), FabricError> {
                 "invalid shard context {}/{}",
                 shard.index, shard.count
             )));
+        }
+        if let Some(plurifold_core::TaskShardPartition::ByteRange {
+            input,
+            offset,
+            length,
+            total_bytes,
+        }) = &shard.partition
+        {
+            if *input >= task.inputs.len()
+                || offset.checked_add(*length).is_none()
+                || offset.saturating_add(*length) > *total_bytes
+            {
+                return Err(FabricError::InvalidTask(
+                    "invalid shard byte-range partition".into(),
+                ));
+            }
         }
     }
     let Some(pipeline) = &task.pipeline else {
@@ -1247,9 +1271,10 @@ mod tests {
     use std::collections::BTreeSet;
 
     use plurifold_core::{
-        Architecture, CooperativeJobSpec, CooperativeRoleSpec, CostHint, EffectSemantics,
-        LinkProfile, LogicalJobSpec, LogicalRoleSpec, ObjectMetadata, ResourceRequirements,
-        RoleImplementation, TaskSpec, TaskTemplate,
+        Architecture, AutoShardPolicy, CooperativeJobSpec, CooperativeRoleSpec, CostHint,
+        EffectSemantics, LinkProfile, LogicalJobSpec, LogicalRoleSpec, ObjectMetadata,
+        ResourceRequirements, RoleImplementation, ShardPartitionSpec, ShardPolicy, ShardPolicySpec,
+        TaskShardPartition, TaskSpec, TaskTemplate,
     };
 
     use super::*;
@@ -1372,7 +1397,7 @@ mod tests {
                         },
                     }],
                     depends_on: vec![],
-                    shards: 1,
+                    shards: 1.into(),
                 },
                 LogicalRoleSpec {
                     name: "consumer".into(),
@@ -1395,7 +1420,7 @@ mod tests {
                         },
                     }],
                     depends_on: vec!["producer".into()],
-                    shards: 1,
+                    shards: 1.into(),
                 },
             ],
             outputs: vec!["consumer".into()],
@@ -1427,7 +1452,7 @@ mod tests {
                         },
                     }],
                     depends_on: vec![],
-                    shards: 1,
+                    shards: 1.into(),
                 },
                 LogicalRoleSpec {
                     name: "middle".into(),
@@ -1450,7 +1475,7 @@ mod tests {
                         },
                     }],
                     depends_on: vec!["producer".into()],
-                    shards: 1,
+                    shards: 1.into(),
                 },
                 LogicalRoleSpec {
                     name: "consumer".into(),
@@ -1473,7 +1498,7 @@ mod tests {
                         },
                     }],
                     depends_on: vec!["middle".into()],
-                    shards: 1,
+                    shards: 1.into(),
                 },
             ],
             outputs: vec!["consumer".into()],
@@ -1867,19 +1892,19 @@ mod tests {
             name: "producer".into(),
             implementations: vec![logical_implementation("producer", "p", 1.0, 10)],
             depends_on: vec![],
-            shards: 1,
+            shards: 1.into(),
         };
         let first_consumer = LogicalRoleSpec {
             name: "first".into(),
             implementations: vec![logical_implementation("first", "c", 1.0, 1)],
             depends_on: vec!["producer".into()],
-            shards: 1,
+            shards: 1.into(),
         };
         let second_consumer = LogicalRoleSpec {
             name: "second".into(),
             implementations: vec![logical_implementation("second", "c", 1.0, 1)],
             depends_on: vec!["producer".into()],
-            shards: 1,
+            shards: 1.into(),
         };
         let spec = LogicalJobSpec {
             id: JobId::new(),
@@ -2244,7 +2269,7 @@ mod tests {
                         1,
                     )],
                     depends_on: vec![],
-                    shards: 1,
+                    shards: 1.into(),
                 }],
                 outputs: vec!["compute".into()],
             })
@@ -2292,7 +2317,7 @@ mod tests {
                         1,
                     )],
                     depends_on: vec![],
-                    shards: 1,
+                    shards: 1.into(),
                 },
                 LogicalRoleSpec {
                     name: "join".into(),
@@ -2301,7 +2326,7 @@ mod tests {
                         logical_implementation("fast-new", "join:fast", 10.0, 1),
                     ],
                     depends_on: vec!["root".into()],
-                    shards: 1,
+                    shards: 1.into(),
                 },
             ],
             outputs: vec!["join".into()],
@@ -2389,7 +2414,7 @@ mod tests {
                             4,
                         )],
                         depends_on: vec![],
-                        shards: 3,
+                        shards: 3.into(),
                     },
                     LogicalRoleSpec {
                         name: "join".into(),
@@ -2400,7 +2425,7 @@ mod tests {
                             12,
                         )],
                         depends_on: vec!["map".into()],
-                        shards: 1,
+                        shards: 1.into(),
                     },
                 ],
                 outputs: vec!["join".into()],
@@ -2426,6 +2451,7 @@ mod tests {
                 Some(plurifold_core::TaskShard {
                     index: index as u32,
                     count: 3,
+                    partition: None,
                 })
             );
         }
@@ -2506,7 +2532,7 @@ mod tests {
                         1,
                     )],
                     depends_on: vec![],
-                    shards: 2,
+                    shards: 2.into(),
                 }],
                 outputs: vec!["map".into()],
             })
@@ -2548,7 +2574,7 @@ mod tests {
                     name: "map".into(),
                     implementations: vec![implementation],
                     depends_on: vec![],
-                    shards: 2,
+                    shards: 2.into(),
                 }],
                 outputs: vec!["map".into()],
             })
@@ -2586,6 +2612,110 @@ mod tests {
         assert_eq!(
             fabric.cooperative_role_views(job_id).unwrap()[0].status,
             CooperativeRoleStatus::Uncertain
+        );
+    }
+
+    #[test]
+    fn auto_sharded_role_materializes_selected_ranges_at_ready_time() {
+        let mut fabric = Fabric::default();
+        let first = ResourceId::new();
+        let second = ResourceId::new();
+        for worker in [first, second] {
+            let mut descriptor = resource(worker);
+            descriptor.features.insert("auto:work".into());
+            fabric.register_resource(descriptor);
+        }
+        fabric.upsert_link(LinkProfile {
+            from: first,
+            to: second,
+            rtt_ms: 0.1,
+            bandwidth_mbps: 10_000.0,
+        });
+        let input = ObjectId::new();
+        fabric
+            .publish_object(ObjectMetadata {
+                id: input,
+                size_bytes: 1_000,
+                digest: Some("sha256:auto-input".into()),
+                encoding: None,
+                locations: vec![first],
+                producer: None,
+            })
+            .unwrap();
+        let job_id = JobId::new();
+        fabric
+            .submit_logical(LogicalJobSpec {
+                id: job_id,
+                roles: vec![LogicalRoleSpec {
+                    name: "map".into(),
+                    implementations: vec![RoleImplementation {
+                        name: "worker".into(),
+                        task: TaskTemplate {
+                            artifact: "builtin:identity".into(),
+                            entrypoint: "run".into(),
+                            arguments: vec![],
+                            inputs: vec![input],
+                            requirements: ResourceRequirements {
+                                required_features: BTreeSet::from(["auto:work".into()]),
+                                ..ResourceRequirements::default()
+                            },
+                            effects: EffectSemantics::Pure,
+                            cost: CostHint {
+                                compute_ms_on_reference: 2_000.0,
+                                output_bytes: 1_000,
+                            },
+                        },
+                    }],
+                    depends_on: vec![],
+                    shards: ShardPolicy::Policy(ShardPolicySpec::Auto(AutoShardPolicy {
+                        max_shards: 4,
+                        partition: ShardPartitionSpec::ByteRange { input: 0 },
+                        per_shard_overhead_ms: 0.0,
+                        min_gain_ratio: 0.05,
+                    })),
+                }],
+                outputs: vec!["map".into()],
+            })
+            .unwrap();
+
+        let role = fabric.cooperative_role_views(job_id).unwrap().remove(0);
+        let task_ids = match role.status {
+            CooperativeRoleStatus::Sharded { tasks, completed } => {
+                assert_eq!(completed, 0);
+                tasks
+            }
+            status => panic!("auto role was not materialized as shards: {status:?}"),
+        };
+        assert_eq!(task_ids.len(), 2);
+        assert_eq!(
+            fabric
+                .task_spec(task_ids[0])
+                .unwrap()
+                .shard
+                .as_ref()
+                .unwrap()
+                .partition,
+            Some(TaskShardPartition::ByteRange {
+                input: 0,
+                offset: 0,
+                length: 500,
+                total_bytes: 1_000,
+            })
+        );
+        assert_eq!(
+            fabric
+                .task_spec(task_ids[1])
+                .unwrap()
+                .shard
+                .as_ref()
+                .unwrap()
+                .partition,
+            Some(TaskShardPartition::ByteRange {
+                input: 0,
+                offset: 500,
+                length: 500,
+                total_bytes: 1_000,
+            })
         );
     }
 }

@@ -82,9 +82,21 @@ impl TopologyAwareScheduler {
         let compute_ms = task.cost.compute_ms_on_reference / resource.performance_score;
         let mut input_transfer_ms = 0.0;
 
-        for input_id in &task.inputs {
+        for (input_index, input_id) in task.inputs.iter().enumerate() {
             let object = &objects[input_id];
             if object.is_local_to(resource.id) {
+                continue;
+            }
+            let transfer_bytes = match task.input_byte_range(input_index) {
+                Some((offset, length)) => {
+                    if offset.checked_add(length)? > object.size_bytes {
+                        return None;
+                    }
+                    length
+                }
+                None => object.size_bytes,
+            };
+            if transfer_bytes == 0 {
                 continue;
             }
 
@@ -92,7 +104,7 @@ impl TopologyAwareScheduler {
                 .locations
                 .iter()
                 .filter_map(|source| {
-                    topology.transfer_time_ms(*source, resource.id, object.size_bytes)
+                    topology.transfer_time_ms(*source, resource.id, transfer_bytes)
                 })
                 .min_by(f64::total_cmp)?;
             input_transfer_ms += best_transfer;
@@ -159,7 +171,8 @@ mod tests {
 
     use plurifold_core::{
         Architecture, CostHint, EffectSemantics, LinkProfile, ObjectId, ObjectMetadata,
-        ResourceDescriptor, ResourceId, ResourceRequirements, TaskId, TaskSpec, TopologySnapshot,
+        ResourceDescriptor, ResourceId, ResourceRequirements, TaskId, TaskShard,
+        TaskShardPartition, TaskSpec, TopologySnapshot,
     };
 
     use super::*;
@@ -266,5 +279,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(decision.resource_id, remote);
+    }
+
+    #[test]
+    fn byte_range_shard_charges_only_partition_transfer_bytes() {
+        let source = ResourceId::new();
+        let remote = ResourceId::new();
+        let object_id = ObjectId::new();
+        let object_size = 100 << 20;
+        let range_size = 1 << 20;
+        let objects = HashMap::from([(
+            object_id,
+            ObjectMetadata {
+                id: object_id,
+                size_bytes: object_size,
+                digest: None,
+                encoding: None,
+                locations: vec![source],
+                producer: None,
+            },
+        )]);
+        let link = LinkProfile {
+            from: source,
+            to: remote,
+            rtt_ms: 100.0,
+            bandwidth_mbps: 100.0,
+        };
+        let topology = TopologySnapshot {
+            links: vec![link.clone()],
+        };
+        let mut ranged = task(object_id, 0.0);
+        ranged.shard = Some(TaskShard {
+            index: 0,
+            count: 2,
+            partition: Some(TaskShardPartition::ByteRange {
+                input: 0,
+                offset: 0,
+                length: range_size,
+                total_bytes: object_size,
+            }),
+        });
+
+        let decision = TopologyAwareScheduler::default()
+            .choose(&ranged, &[resource(remote, 1.0)], &objects, &topology)
+            .unwrap();
+        let expected = link.transfer_time_ms(range_size).unwrap();
+        assert!((decision.cost.input_transfer_ms - expected).abs() < 1e-9);
     }
 }

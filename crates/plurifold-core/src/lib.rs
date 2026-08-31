@@ -183,6 +183,33 @@ pub struct TaskSpec {
 pub struct TaskShard {
     pub index: u32,
     pub count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<TaskShardPartition>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TaskShardPartition {
+    ByteRange {
+        input: usize,
+        offset: u64,
+        length: u64,
+        total_bytes: u64,
+    },
+}
+
+impl TaskSpec {
+    pub fn input_byte_range(&self, input_index: usize) -> Option<(u64, u64)> {
+        match self.shard.as_ref()?.partition.as_ref()? {
+            TaskShardPartition::ByteRange {
+                input,
+                offset,
+                length,
+                ..
+            } if *input == input_index => Some((*offset, *length)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -262,19 +289,95 @@ pub struct RoleImplementation {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ShardPolicy {
+    /// Backward-compatible fixed contribution count. Existing JSON such as `"shards": 3`
+    /// deserializes to this variant.
+    Fixed(u32),
+    Policy(ShardPolicySpec),
+}
+
+impl Default for ShardPolicy {
+    fn default() -> Self {
+        Self::Fixed(1)
+    }
+}
+
+impl From<u32> for ShardPolicy {
+    fn from(count: u32) -> Self {
+        Self::Fixed(count)
+    }
+}
+
+impl ShardPolicy {
+    pub fn fixed_count(&self) -> Option<u32> {
+        match self {
+            Self::Fixed(count) => Some(*count),
+            Self::Policy(_) => None,
+        }
+    }
+
+    pub fn auto(&self) -> Option<&AutoShardPolicy> {
+        match self {
+            Self::Policy(ShardPolicySpec::Auto(policy)) => Some(policy),
+            Self::Fixed(_) => None,
+        }
+    }
+
+    pub fn may_fan_out(&self) -> bool {
+        match self {
+            Self::Fixed(count) => *count > 1,
+            Self::Policy(ShardPolicySpec::Auto(_)) => true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ShardPolicySpec {
+    Auto(AutoShardPolicy),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutoShardPolicy {
+    pub max_shards: u32,
+    pub partition: ShardPartitionSpec,
+    /// Fixed application/runtime overhead paid by each generated child Task in addition to the
+    /// proportional share of `TaskTemplate.cost.compute_ms_on_reference`.
+    #[serde(default)]
+    pub per_shard_overhead_ms: f64,
+    /// Required relative makespan improvement before increasing shard count. Defaults to 5%.
+    #[serde(default = "default_auto_min_gain_ratio")]
+    pub min_gain_ratio: f64,
+}
+
+fn default_auto_min_gain_ratio() -> f64 {
+    0.05
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ShardPartitionSpec {
+    /// Uniform contiguous byte ranges of one explicit TaskTemplate input. This intentionally does
+    /// not infer record/tensor boundaries.
+    ByteRange { input: usize },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LogicalRoleSpec {
     pub name: String,
     pub implementations: Vec<RoleImplementation>,
     #[serde(default)]
     pub depends_on: Vec<String>,
-    /// Number of independent contributions required for this logical role. Each shard receives the
-    /// same logical inputs plus a TaskShard { index, count } context. Cost hints are per shard.
+    /// Fixed mode preserves the numeric-shard semantics: cost hints are per independent contribution and all
+    /// logical inputs are replicated. Auto mode treats the template cost as total single-shard work
+    /// and may partition the declared input into byte ranges.
     #[serde(default = "default_role_shards")]
-    pub shards: u32,
+    pub shards: ShardPolicy,
 }
 
-const fn default_role_shards() -> u32 {
-    1
+fn default_role_shards() -> ShardPolicy {
+    ShardPolicy::default()
 }
 
 /// A higher-level cooperative computation whose role boundaries are declared by the application or
@@ -412,5 +515,22 @@ mod tests {
     fn exclusive_effects_are_not_automatically_retryable() {
         assert!(!EffectSemantics::Exclusive.automatically_retryable());
         assert!(EffectSemantics::Pure.automatically_retryable());
+    }
+
+    #[test]
+    fn shard_policy_keeps_numeric_wire_compatibility_and_accepts_auto_policy() {
+        let fixed: ShardPolicy = serde_json::from_str("3").unwrap();
+        assert_eq!(fixed.fixed_count(), Some(3));
+        assert_eq!(serde_json::to_string(&fixed).unwrap(), "3");
+
+        let auto: ShardPolicy = serde_json::from_str(
+            r#"{"mode":"auto","max_shards":4,"partition":{"kind":"byte_range","input":0},"per_shard_overhead_ms":2.0}"#,
+        )
+        .unwrap();
+        let policy = auto.auto().unwrap();
+        assert_eq!(policy.max_shards, 4);
+        assert_eq!(policy.partition, ShardPartitionSpec::ByteRange { input: 0 });
+        assert_eq!(policy.per_shard_overhead_ms, 2.0);
+        assert_eq!(policy.min_gain_ratio, 0.05);
     }
 }

@@ -47,7 +47,9 @@
 - [ ] dynamic role insertion while a job is running
 - [ ] automatic role-boundary inference/decomposition from higher-level computation graphs or source programs
 - [x] explicit sharded roles with multi-resource fan-out and deterministic all-shards fan-in
-- [ ] adaptive shard-count selection, automatic input partitioning, and hierarchical/quorum reduction policies
+- [x] topology-aware automatic shard-count selection for declared byte-range inputs
+- [x] range-aware peer transfer and range-sized scheduling cost
+- [ ] record/tensor-aware partitioners and hierarchical/quorum reduction policies
 
 ## Phase 3 — Topology and graph adaptation
 

@@ -1,6 +1,6 @@
 # Protocol
 
-Plurifold v0.9 uses a deliberately small **HTTP/JSON control plane** (protocol constant `API_VERSION = 5`). The Rust request/response types in `plurifold-protocol` are authoritative for the current prototype. `proto/plurifold.proto` remains a transport-neutral design sketch for a possible future binary RPC encoding; it is not generated into the build.
+Plurifold v0.10 uses a deliberately small **HTTP/JSON control plane** (protocol constant `API_VERSION = 6`). The Rust request/response types in `plurifold-protocol` are authoritative for the current prototype. `proto/plurifold.proto` remains a transport-neutral design sketch for a possible future binary RPC encoding; it is not generated into the build.
 
 ## Membership
 
@@ -28,37 +28,37 @@ Completion uses `POST /v1/work/complete`. The coordinator accepts the outputs on
 
 If a lease expires, replay-safe work returns to `Pending`. An `Exclusive` task instead becomes `Uncertain` and requires application/operator reconciliation.
 
-`TaskSpec` now has an optional runtime-generated `pipeline`. A `TaskPipeline` is an ordered list of stages. Stage inputs explicitly bind either to an external Task input index or to the immediately previous stage output. Ordinary submitted Tasks leave this field absent. The v0.9 agent uses it for fused builtin-family work: all external Objects are materialized once, stage intermediates remain in memory, and only the final bytes are committed as the Task output.
+`TaskSpec` now has an optional runtime-generated `pipeline`. A `TaskPipeline` is an ordered list of stages. Stage inputs explicitly bind either to an external Task input index or to the immediately previous stage output. Ordinary submitted Tasks leave this field absent. The v0.10 agent uses it for fused builtin-family work: all external Objects are materialized once, stage intermediates remain in memory, and only the final bytes are committed as the Task output.
 
-`TaskSpec` also has optional `shard: { index, count }` context. A `LogicalRoleSpec` has `shards` with a wire default of `1`. For `shards > 1`, the coordinator creates N ordinary child Tasks carrying indices `0..N-1`; all children receive the same logical input Object IDs. The context describes contribution identity only—Plurifold does not automatically slice task inputs. A valid shard requires `count > 0` and `index < count`.
+`TaskSpec` also has optional shard context. Fixed numeric `LogicalRoleSpec.shards` remains wire-compatible with API 5 and produces `TaskShard { index, count, partition: null }`. API 6 additionally accepts an object-valued auto policy with `mode: "auto"`, `max_shards`, `partition`, optional `per_shard_overhead_ms`, and optional `min_gain_ratio`. The current partition kind is `byte_range` over one explicit Task input. Auto-generated child Tasks carry `partition: { kind: "byte_range", input, offset, length, total_bytes }`. A valid shard requires `count > 0`, `index < count`, a valid input index, and an in-bounds range.
 
 ## Cooperative jobs
 
 `POST /v1/jobs` submits a `CooperativeJobSpec`. Root roles are immediately materialized as ordinary Tasks. When a role completes, the coordinator records its output Object IDs and materializes any roles whose dependencies are now satisfied. Those downstream Tasks use predecessor outputs as normal object inputs, so cross-resource edges reuse the same replica discovery and direct peer-transfer path as standalone Tasks.
 
-`GET /v1/jobs/{id}` returns either the fixed `CooperativeJobSpec` or live `LogicalJobSpec`, plus each role's state. For an ordinary dynamically selected role it reports the chosen implementation, advisory resource, ready-time estimated cost, and optional fusion metadata. A sharded role instead reports `status: Sharded { tasks, completed }` while active and a `shards[]` array containing each child index, Task ID, selected implementation, advisory Resource, estimated cost, and current `TaskStatus`. Once all child Tasks finish, the role becomes `Completed([...])` with output Object IDs ordered by shard index. In API 5, fusion metadata still contains `chain_roles`, `stage_index`, `estimated_avoided_transfer_ms`, and `estimated_vs_separate_ms`.
+`GET /v1/jobs/{id}` returns either the fixed `CooperativeJobSpec` or live `LogicalJobSpec`, plus each role's state. For an ordinary dynamically selected role it reports the chosen implementation, advisory resource, ready-time estimated cost, and optional fusion metadata. A sharded role instead reports `status: Sharded { tasks, completed }` while active and a `shards[]` array containing each child index, Task ID, selected implementation, advisory Resource, estimated cost, and current `TaskStatus`. Once all child Tasks finish, the role becomes `Completed([...])` with output Object IDs ordered by shard index. In API 6, fusion metadata still contains `chain_roles`, `stage_index`, `estimated_avoided_transfer_ms`, and `estimated_vs_separate_ms`.
 
 ## Logical planning
 
-`POST /v1/jobs/plan` accepts a `LogicalJobSpec` whose roles contain alternative Task implementations and optional shard counts. It returns a `CooperativePlan` with `roles[].shards[]`; each predicted shard contains its index, selected implementation, placement-cost breakdown, and predicted Resource. The response also contains an estimated makespan. API 5 no longer embeds a compiled `CooperativeJobSpec`, because different shards of one logical role may legitimately select different implementations/resources and live execution is not a frozen compilation.
+`POST /v1/jobs/plan` accepts a `LogicalJobSpec` whose roles contain alternative Task implementations and fixed or automatic shard policies. It returns a `CooperativePlan` with `roles[].shards[]`; each predicted shard contains its index, selected implementation, optional concrete partition, placement-cost breakdown, and predicted Resource. The response also contains an estimated makespan. Live execution remains a separate ready-time decision.
 
 `POST /v1/jobs/auto` accepts the same `LogicalJobSpec` but stores the logical definition rather than freezing the preview. Its response includes the Job ID and an optional `initial_plan`; the preview is absent when the current snapshot has no complete feasible plan, but the logical job can still be accepted. Each role is implementation-selected when its real dependencies complete. If no implementation is feasible then, the role remains `Ready`; later agent polling retries it against current membership, topology, and Object replicas. This is what allows a hot-joined resource to change a downstream implementation choice after submission.
 
-For a ready logical role with `shards > 1`, the coordinator selects N child Tasks and records one aggregate logical-role state. Dependent roles remain blocked until all shards complete. The child Task IDs are stored in shard-index order; completed outputs are flattened in that same order, making fan-in deterministic even when completion order differs. Replay-safe child lease expiry only requeues that child. An unreplayable child entering `Uncertain` marks the containing role/job `Uncertain`. Sharded roles are not candidates for linear fusion in v0.9.
+For a fixed multi-shard or auto-sharded ready role, the coordinator creates the selected child Tasks and records one aggregate logical-role state. Auto mode chooses the count at readiness and attaches concrete ranges. Dependent roles remain blocked until all children complete; outputs are flattened in shard-index order. Replay-safe lease expiry requeues only the affected child, while an unreplayable child makes the role/job `Uncertain`. Sharded roles are not candidates for linear fusion in v0.10.
 
-Before a currently ready unsharded logical role is materialized, v0.9 may discover a maximal safe linear chain and replace a cost-selected prefix with one multi-stage `TaskPipeline`. This is an execution-time transformation, not part of the `job plan` snapshot contract. Chain growth stops at fan-out, fan-in, a declared interior job output, or another non-linear boundary. Only a consecutive Pure builtin-family prefix is eligible for fusion; a non-fusible tail can remain separate. The runtime compares each candidate prefix using projected whole-chain cost, so it can select two stages, three stages, or more rather than always taking the maximum. Internal fused stages do not publish Objects. The last fused stage does publish its output, which is the job result when the prefix reaches an output role or the normal predecessor Object when a suffix remains.
+Before a currently ready unsharded logical role is materialized, v0.10 may discover a maximal safe linear chain and replace a cost-selected prefix with one multi-stage `TaskPipeline`. This is an execution-time transformation, not part of the `job plan` snapshot contract. Chain growth stops at fan-out, fan-in, a declared interior job output, or another non-linear boundary. Only a consecutive Pure builtin-family prefix is eligible for fusion; a non-fusible tail can remain separate. The runtime compares each candidate prefix using projected whole-chain cost, so it can select two stages, three stages, or more rather than always taking the maximum. Internal fused stages do not publish Objects. The last fused stage does publish its output, which is the job result when the prefix reaches an output role or the normal predecessor Object when a suffix remains.
 
 ## Object metadata and data plane
 
 Object metadata is published to `POST /v1/objects/publish`. When an agent fetches an existing object into its local cache, it records the new physical replica through `POST /v1/objects/replica`.
 
-Bulk object bytes do **not** pass through the coordinator. In v0.9 each agent exposes:
+Bulk object bytes do **not** pass through the coordinator. In v0.10 each agent exposes:
 
 - `POST /v1/objects` — stage bytes into the local SHA-256 CAS and create logical object metadata;
-- `GET /v1/blobs/{sha256}` — serve immutable bytes directly to another agent.
+- `GET /v1/blobs/{sha256}` — serve immutable bytes directly to another agent, including one explicit HTTP byte range with `206`, `Content-Range`, and `x-plurifold-range-digest`.
 - `GET /v1/probe/{bytes}` — serve a bounded synthetic payload for peer RTT/throughput measurement (maximum 1 MiB).
 
-The receiving agent recomputes the SHA-256 digest before using the object. The transport can therefore be replaced later by HTTP range transfer, object storage, RDMA/site-local paths, or relays without changing logical object identity.
+Full-object fetches recompute the full SHA-256 digest and register the new replica. Partial auto-shard fetches request only the declared range, verify `x-plurifold-range-digest`, and deliberately do not register that partial sequence as a full Object replica. The transport can still be replaced later by object storage, RDMA/site-local paths, or relays without changing logical Object identity.
 
 ## Topology
 
@@ -92,4 +92,4 @@ Agents periodically reuse `GET /v1/resources` to discover peer data endpoints. O
 
 Resource capabilities and task features use extensible string identifiers where premature closed enums would block new accelerator/runtime types. Wire-version negotiation and backward compatibility are not implemented yet.
 
-The v0.9 service is **unauthenticated** and defaults to loopback. Cross-trust-domain authentication, authorization, TLS, signed artifacts, and secret locality are design requirements in `security.md`, not claims of the current implementation.
+The v0.10 service is **unauthenticated** and defaults to loopback. Cross-trust-domain authentication, authorization, TLS, signed artifacts, and secret locality are design requirements in `security.md`, not claims of the current implementation.

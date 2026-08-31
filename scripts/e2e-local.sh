@@ -211,6 +211,7 @@ wait_http "$COORD/healthz"
   --feature demo:role-left \
   --feature demo:shard \
   --feature demo:shard-join \
+  --feature auto:worker-a \
   --feature fusion:producer \
   --feature fusion:middle \
   --feature fusion:consumer \
@@ -230,6 +231,7 @@ PIDS+=("$A_PID")
   --performance 1 \
   --feature demo:role-right \
   --feature demo:shard \
+  --feature auto:worker-b \
   --coordinator "$COORD" \
   --bind "127.0.0.1:${B_PORT}" \
   --advertise "$B_URL" \
@@ -562,6 +564,7 @@ done
   --performance 20 \
   --feature demo:join-fast \
   --feature demo:shard \
+  --feature auto:worker-c \
   --feature fusion:middle \
   --feature fusion:consumer \
   --coordinator "$COORD" \
@@ -692,6 +695,152 @@ assert len(map_role["status"]["Completed"])==3, map_role
 assert join["planned_resource"]==sys.argv[1], join
 ' "$A_ID"
 echo "fan-out-fan-in: 3 shards ran concurrently on A/B/C and joined on worker-a"
+
+python3 - <<'PYDATA' >"$TMP/auto-range-input"
+import sys
+chunk = bytes(range(256))
+sys.stdout.buffer.write(chunk * (1536 * 1024 // len(chunk)))
+PYDATA
+AUTO_RANGE_DIGEST=$(sha256sum "$TMP/auto-range-input" | awk '{print $1}')
+AUTO_RANGE_SIZE=$(wc -c <"$TMP/auto-range-input" | tr -d ' ')
+AUTO_RANGE_OBJ=$(./target/debug/plurifold put \
+  --coordinator "$COORD" --agent "$A_URL" --file "$TMP/auto-range-input")
+cat >"$TMP/auto-sharded-job.json" <<JSON
+{
+  "roles": [
+    {
+      "name": "map",
+      "implementations": [
+        {
+          "name": "worker-a-native",
+          "task": {
+            "artifact": "builtin:shard-sleep-input",
+            "entrypoint": "run",
+            "arguments": ["1500"],
+            "inputs": ["$AUTO_RANGE_OBJ"],
+            "requirements": {
+              "architecture": null,
+              "min_memory_bytes": 0,
+              "accelerator": null,
+              "required_features": ["auto:worker-a"]
+            },
+            "effects": "Pure",
+            "cost": {"compute_ms_on_reference": 6000.0, "output_bytes": $AUTO_RANGE_SIZE}
+          }
+        },
+        {
+          "name": "worker-b-native",
+          "task": {
+            "artifact": "builtin:shard-sleep-input",
+            "entrypoint": "run",
+            "arguments": ["1500"],
+            "inputs": ["$AUTO_RANGE_OBJ"],
+            "requirements": {
+              "architecture": null,
+              "min_memory_bytes": 0,
+              "accelerator": null,
+              "required_features": ["auto:worker-b"]
+            },
+            "effects": "Pure",
+            "cost": {"compute_ms_on_reference": 3000.0, "output_bytes": $AUTO_RANGE_SIZE}
+          }
+        },
+        {
+          "name": "worker-c-native",
+          "task": {
+            "artifact": "builtin:shard-sleep-input",
+            "entrypoint": "run",
+            "arguments": ["1500"],
+            "inputs": ["$AUTO_RANGE_OBJ"],
+            "requirements": {
+              "architecture": null,
+              "min_memory_bytes": 0,
+              "accelerator": null,
+              "required_features": ["auto:worker-c"]
+            },
+            "effects": "Pure",
+            "cost": {"compute_ms_on_reference": 60000.0, "output_bytes": $AUTO_RANGE_SIZE}
+          }
+        }
+      ],
+      "depends_on": [],
+      "shards": {
+        "mode": "auto",
+        "max_shards": 3,
+        "partition": {"kind": "byte_range", "input": 0},
+        "per_shard_overhead_ms": 0.0,
+        "min_gain_ratio": 0.05
+      }
+    },
+    {
+      "name": "join",
+      "implementations": [{
+        "name": "join-worker",
+        "task": {
+          "artifact": "builtin:concat",
+          "entrypoint": "run",
+          "requirements": {
+            "architecture": null,
+            "min_memory_bytes": 0,
+            "accelerator": null,
+            "required_features": ["demo:shard-join"]
+          },
+          "effects": "Pure",
+          "cost": {"compute_ms_on_reference": 100.0, "output_bytes": $AUTO_RANGE_SIZE}
+        }
+      }],
+      "depends_on": ["map"]
+    }
+  ],
+  "outputs": ["join"]
+}
+JSON
+
+AUTO_RANGE_PLAN=$(./target/debug/plurifold job plan \
+  --coordinator "$COORD" --file "$TMP/auto-sharded-job.json")
+printf '%s' "$AUTO_RANGE_PLAN" | python3 -c 'import json,sys
+plan=json.load(sys.stdin)
+role=next(role for role in plan["roles"] if role["name"]=="map")
+assert len(role["shards"])==3, role
+seen={shard["placement"]["resource_id"] for shard in role["shards"]}
+assert seen==set(sys.argv[1:]), (seen,sys.argv[1:])
+' "$A_ID" "$B_ID" "$C_ID"
+AUTO_RANGE_JOB=$(./target/debug/plurifold job auto-submit \
+  --coordinator "$COORD" --file "$TMP/auto-sharded-job.json")
+AUTO_RANGE_RUNNING=""
+for _ in $(seq 1 120); do
+  AUTO_RANGE_VIEW=$(./target/debug/plurifold job status \
+    --coordinator "$COORD" --job "$AUTO_RANGE_JOB")
+  AUTO_RANGE_RUNNING=$(printf '%s' "$AUTO_RANGE_VIEW" | python3 -c 'import json,sys
+role=next(role for role in json.load(sys.stdin)["roles"] if role["name"]=="map")
+r=[]
+for shard in role.get("shards",[]):
+    status=shard["status"]
+    if isinstance(status,dict) and "Running" in status:
+        r.append(status["Running"]["resource_id"])
+if len(r)==3:
+    print(" ".join(r))')
+  [[ -n "$AUTO_RANGE_RUNNING" ]] && break
+  sleep 0.05
+done
+[[ -n "$AUTO_RANGE_RUNNING" ]]
+printf '%s' "$AUTO_RANGE_RUNNING" | python3 -c 'import sys
+assert set(sys.stdin.read().split())==set(sys.argv[1:])
+' "$A_ID" "$B_ID" "$C_ID"
+./target/debug/plurifold job wait \
+  --coordinator "$COORD" --job "$AUTO_RANGE_JOB" --timeout-s 12 >/dev/null
+[[ -f "$TMP/a/sha256/$AUTO_RANGE_DIGEST" ]]
+[[ ! -f "$TMP/b/sha256/$AUTO_RANGE_DIGEST" ]]
+[[ ! -f "$TMP/c/sha256/$AUTO_RANGE_DIGEST" ]]
+AUTO_RANGE_FINAL=$(./target/debug/plurifold job status \
+  --coordinator "$COORD" --job "$AUTO_RANGE_JOB")
+printf '%s' "$AUTO_RANGE_FINAL" | python3 -c 'import json,sys
+view=json.load(sys.stdin)
+role=next(role for role in view["roles"] if role["name"]=="map")
+assert "Completed" in role["status"], role
+assert len(role["status"]["Completed"])==3, role
+'
+echo "auto-sharding: chose 3 A/B/C byte ranges, range-fetched remotely, and reconstructed the original object"
 
 write_fusion_job "$TMP/fusion-low.json" 1
 LOW_FUSION_JOB=$(./target/debug/plurifold job auto-submit \

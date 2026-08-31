@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -24,6 +24,7 @@ use plurifold_protocol::{
 };
 use plurifold_store::LocalObjectStore;
 use reqwest::Client;
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 const PROBE_BYTES: usize = 256 * 1024;
@@ -416,9 +417,18 @@ async fn execute_and_commit(
 
     let work_result = async {
         let mut input_bytes = Vec::with_capacity(assignment.inputs.len());
-        for input in &assignment.inputs {
-            input_bytes
-                .push(materialize_input(client, coordinator, store, resource_id, input).await?);
+        for (input_index, input) in assignment.inputs.iter().enumerate() {
+            input_bytes.push(
+                materialize_input(
+                    client,
+                    coordinator,
+                    store,
+                    resource_id,
+                    input,
+                    assignment.task.input_byte_range(input_index),
+                )
+                .await?,
+            );
         }
 
         let output_bytes = execute_task(&assignment.task, &input_bytes).await?;
@@ -495,12 +505,97 @@ async fn materialize_input(
     store: &LocalObjectStore,
     resource_id: ResourceId,
     input: &ResolvedObject,
+    range: Option<(u64, u64)>,
 ) -> Result<Vec<u8>, String> {
     let digest = input
         .metadata
         .digest
         .as_deref()
         .ok_or_else(|| format!("input {} has no digest", input.metadata.id))?;
+    let range = match range {
+        Some((0, length)) if length == input.metadata.size_bytes => None,
+        other => other,
+    };
+    if let Some((offset, length)) = range {
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| "input byte range overflows".to_owned())?;
+        if end > input.metadata.size_bytes {
+            return Err(format!(
+                "input byte range {offset}..{end} exceeds object size {}",
+                input.metadata.size_bytes
+            ));
+        }
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        if store.contains(digest) {
+            let bytes = store.get(digest).map_err(|error| error.to_string())?;
+            let start = usize::try_from(offset)
+                .map_err(|_| "input byte range start does not fit this platform".to_owned())?;
+            let end = usize::try_from(end)
+                .map_err(|_| "input byte range end does not fit this platform".to_owned())?;
+            return Ok(bytes[start..end].to_vec());
+        }
+
+        let mut last_error = "no replicas supplied".to_owned();
+        for replica in &input.replicas {
+            let response = match client
+                .get(&replica.url)
+                .header(header::RANGE, format!("bytes={offset}-{}", end - 1))
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    last_error = error.to_string();
+                    continue;
+                }
+            };
+            if response.status() != StatusCode::PARTIAL_CONTENT {
+                last_error = format!(
+                    "replica {} returned {} for byte range",
+                    replica.url,
+                    response.status()
+                );
+                continue;
+            }
+            let expected_range_digest = match response
+                .headers()
+                .get("x-plurifold-range-digest")
+                .and_then(|value| value.to_str().ok())
+            {
+                Some(value) => value.to_owned(),
+                None => {
+                    last_error = format!("replica {} omitted range digest", replica.url);
+                    continue;
+                }
+            };
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|error| error.to_string())?
+                .to_vec();
+            if bytes.len() as u64 != length {
+                last_error = format!(
+                    "replica {} returned {} range bytes, expected {length}",
+                    replica.url,
+                    bytes.len()
+                );
+                continue;
+            }
+            let actual = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
+            if actual != expected_range_digest {
+                last_error = format!(
+                    "replica range digest mismatch: expected {expected_range_digest}, received {actual}"
+                );
+                continue;
+            }
+            return Ok(bytes);
+        }
+        return Err(last_error);
+    }
+
     if store.contains(digest) {
         return store.get(digest).map_err(|error| error.to_string());
     }
@@ -625,6 +720,21 @@ async fn execute_builtin_operation(
             tokio::time::sleep(Duration::from_millis(millis)).await;
             Ok(format!("{prefix}:{}:{}", shard.index, shard.count).into_bytes())
         }
+        "builtin:shard-sleep-input" => {
+            shard.ok_or_else(|| "builtin:shard-sleep-input requires shard context".to_owned())?;
+            let millis = arguments
+                .first()
+                .ok_or_else(|| "builtin:shard-sleep-input requires milliseconds".to_owned())?
+                .parse::<u64>()
+                .map_err(|_| {
+                    "builtin:shard-sleep-input milliseconds must be an integer".to_owned()
+                })?;
+            tokio::time::sleep(Duration::from_millis(millis)).await;
+            inputs
+                .first()
+                .cloned()
+                .ok_or_else(|| "builtin:shard-sleep-input requires one input".to_owned())
+        }
         "builtin:sleep" => {
             let millis = arguments
                 .first()
@@ -678,6 +788,7 @@ async fn put_object(
 async fn get_blob(
     State(state): State<DataState>,
     Path(digest): Path<String>,
+    headers: HeaderMap,
 ) -> Result<Response, DataError> {
     let digest = format!("sha256:{digest}");
     let bytes = state.store.get(&digest).map_err(|error| match error {
@@ -688,7 +799,33 @@ async fn get_blob(
         }
         other => DataError::internal(other),
     })?;
-    let mut response = bytes.into_response();
+    let total = bytes.len();
+    let requested = parse_byte_range(&headers, total)?;
+    let (payload, range) = match requested {
+        Some((start, end_exclusive)) => (
+            bytes[start..end_exclusive].to_vec(),
+            Some((start, end_exclusive)),
+        ),
+        None => (bytes, None),
+    };
+    let range_digest = range.map(|_| format!("sha256:{}", hex::encode(Sha256::digest(&payload))));
+    let mut response = payload.into_response();
+    if let Some((start, end_exclusive)) = range {
+        *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+        response.headers_mut().insert(
+            header::CONTENT_RANGE,
+            HeaderValue::from_str(&format!("bytes {start}-{}/{total}", end_exclusive - 1))
+                .map_err(DataError::internal)?,
+        );
+        response.headers_mut().insert(
+            "x-plurifold-range-digest",
+            HeaderValue::from_str(range_digest.as_deref().expect("range digest exists"))
+                .map_err(DataError::internal)?,
+        );
+    }
+    response
+        .headers_mut()
+        .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),
@@ -698,6 +835,42 @@ async fn get_blob(
         HeaderValue::from_str(&digest).map_err(DataError::internal)?,
     );
     Ok(response)
+}
+
+fn parse_byte_range(
+    headers: &HeaderMap,
+    total: usize,
+) -> Result<Option<(usize, usize)>, DataError> {
+    let Some(value) = headers.get(header::RANGE) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| DataError::bad_request("Range header is not valid ASCII"))?;
+    let Some(spec) = value.strip_prefix("bytes=") else {
+        return Err(DataError::bad_request("only byte ranges are supported"));
+    };
+    if spec.contains(',') {
+        return Err(DataError::bad_request(
+            "multiple byte ranges are not supported",
+        ));
+    }
+    let (start, end) = spec
+        .split_once('-')
+        .ok_or_else(|| DataError::bad_request("invalid byte range"))?;
+    let start = start
+        .parse::<usize>()
+        .map_err(|_| DataError::bad_request("byte range start must be an integer"))?;
+    let end = end
+        .parse::<usize>()
+        .map_err(|_| DataError::bad_request("byte range end must be an integer"))?;
+    if start > end || end >= total {
+        return Err(DataError {
+            status: StatusCode::RANGE_NOT_SATISFIABLE,
+            message: "byte range is outside the object".into(),
+        });
+    }
+    Ok(Some((start, end + 1)))
 }
 
 async fn parse_json<T: serde::de::DeserializeOwned>(
@@ -853,11 +1026,51 @@ mod tests {
             requirements: ResourceRequirements::default(),
             effects: EffectSemantics::Pure,
             cost: CostHint::default(),
-            shard: Some(TaskShard { index: 1, count: 3 }),
+            shard: Some(TaskShard {
+                index: 1,
+                count: 3,
+                partition: None,
+            }),
             pipeline: None,
         };
 
         let output = execute_task(&task, &[]).await.unwrap();
         assert_eq!(output, b"piece:1:3");
+    }
+
+    #[test]
+    fn parses_single_http_byte_range() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=2-5"));
+        assert_eq!(parse_byte_range(&headers, 10).ok(), Some(Some((2, 6))));
+    }
+
+    #[tokio::test]
+    async fn local_materialization_returns_only_requested_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalObjectStore::new(dir.path()).unwrap();
+        let stored = store.put(b"abcdefghij").unwrap();
+        let input = ResolvedObject {
+            metadata: ObjectMetadata {
+                id: ObjectId::new(),
+                size_bytes: 10,
+                digest: Some(stored.digest),
+                encoding: None,
+                locations: vec![],
+                producer: None,
+            },
+            replicas: vec![],
+        };
+        let bytes = materialize_input(
+            &Client::new(),
+            "http://127.0.0.1:1",
+            &store,
+            ResourceId::new(),
+            &input,
+            Some((3, 4)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bytes, b"defg");
     }
 }
