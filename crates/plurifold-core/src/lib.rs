@@ -196,12 +196,27 @@ pub enum TaskShardPartition {
         length: u64,
         total_bytes: u64,
     },
+    Records {
+        input: usize,
+        record_start: u64,
+        record_count: u64,
+        total_records: u64,
+        offset: u64,
+        length: u64,
+        total_bytes: u64,
+    },
 }
 
-impl TaskSpec {
+impl TaskShardPartition {
     pub fn input_byte_range(&self, input_index: usize) -> Option<(u64, u64)> {
-        match self.shard.as_ref()?.partition.as_ref()? {
-            TaskShardPartition::ByteRange {
+        match self {
+            Self::ByteRange {
+                input,
+                offset,
+                length,
+                ..
+            }
+            | Self::Records {
                 input,
                 offset,
                 length,
@@ -209,6 +224,62 @@ impl TaskSpec {
             } if *input == input_index => Some((*offset, *length)),
             _ => None,
         }
+    }
+
+    pub fn work_fraction(&self) -> f64 {
+        match self {
+            Self::ByteRange {
+                length,
+                total_bytes,
+                ..
+            } => fraction(*length, *total_bytes),
+            Self::Records {
+                record_count,
+                total_records,
+                ..
+            } => fraction(*record_count, *total_records),
+        }
+    }
+
+    pub fn scaled_output_bytes(&self, total_output_bytes: u64) -> u64 {
+        let (start, count, total) = match self {
+            Self::ByteRange {
+                offset,
+                length,
+                total_bytes,
+                ..
+            } => (*offset, *length, *total_bytes),
+            Self::Records {
+                record_start,
+                record_count,
+                total_records,
+                ..
+            } => (*record_start, *record_count, *total_records),
+        };
+        if total == 0 {
+            return total_output_bytes;
+        }
+        let output_start = total_output_bytes as u128 * start as u128 / total as u128;
+        let output_end = total_output_bytes as u128 * (start + count) as u128 / total as u128;
+        (output_end - output_start) as u64
+    }
+}
+
+fn fraction(part: u64, total: u64) -> f64 {
+    if total == 0 {
+        1.0
+    } else {
+        part as f64 / total as f64
+    }
+}
+
+impl TaskSpec {
+    pub fn input_byte_range(&self, input_index: usize) -> Option<(u64, u64)> {
+        self.shard
+            .as_ref()?
+            .partition
+            .as_ref()?
+            .input_byte_range(input_index)
     }
 }
 
@@ -358,9 +429,44 @@ fn default_auto_min_gain_ratio() -> f64 {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ShardPartitionSpec {
-    /// Uniform contiguous byte ranges of one explicit TaskTemplate input. This intentionally does
-    /// not infer record/tensor boundaries.
+    /// Uniform contiguous byte ranges of one explicit TaskTemplate input.
     ByteRange { input: usize },
+    /// Record boundaries are supplied explicitly by the application or a domain library. Offsets
+    /// contain every record start plus the final object length, for example [0, 5, 11] for two
+    /// records. Plurifold never infers the file format from payload bytes.
+    Records { input: usize, offsets: Vec<u64> },
+}
+
+impl ShardPartitionSpec {
+    pub fn input(&self) -> usize {
+        match self {
+            Self::ByteRange { input } | Self::Records { input, .. } => *input,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoleReductionSpec {
+    /// Human-readable reducer implementation name carried into plan explanations.
+    pub name: String,
+    /// The reducer receives only the dynamically selected child outputs as inputs. It must be Pure
+    /// and ordered-associative: regrouping adjacent inputs may change the tree shape but not the
+    /// application-visible result.
+    pub task: TaskTemplate,
+    #[serde(default = "default_reduction_max_fan_in")]
+    pub max_fan_in: u32,
+    /// Adjacent outputs with at least one replica pair at or below this RTT are reduced together
+    /// before a cross-domain fallback level is created.
+    #[serde(default = "default_reduction_locality_rtt_ms")]
+    pub locality_rtt_ms: f64,
+}
+
+const fn default_reduction_max_fan_in() -> u32 {
+    4
+}
+
+fn default_reduction_locality_rtt_ms() -> f64 {
+    2.0
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -369,11 +475,13 @@ pub struct LogicalRoleSpec {
     pub implementations: Vec<RoleImplementation>,
     #[serde(default)]
     pub depends_on: Vec<String>,
-    /// Fixed mode preserves the numeric-shard semantics: cost hints are per independent contribution and all
-    /// logical inputs are replicated. Auto mode treats the template cost as total single-shard work
-    /// and may partition the declared input into byte ranges.
+    /// Fixed mode preserves the numeric-shard semantics: cost hints are per independent contribution
+    /// and all logical inputs are replicated. Auto mode treats the template cost as total single-shard
+    /// work and may partition one declared input.
     #[serde(default = "default_role_shards")]
     pub shards: ShardPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reduction: Option<RoleReductionSpec>,
 }
 
 fn default_role_shards() -> ShardPolicy {

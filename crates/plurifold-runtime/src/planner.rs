@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use plurifold_core::{
     AcceleratorRequirement, Architecture, AutoShardPolicy, EffectSemantics, LogicalJobSpec,
     ObjectId, ObjectMetadata, PipelineInput, ResourceDescriptor, ResourceId, ResourceRequirements,
-    ShardPartitionSpec, ShardPolicy, ShardPolicySpec, TaskId, TaskPipeline, TaskPipelineStage,
-    TaskShard, TaskShardPartition, TaskSpec, TaskTemplate, TopologySnapshot,
+    RoleReductionSpec, ShardPartitionSpec, ShardPolicy, ShardPolicySpec, TaskId, TaskPipeline,
+    TaskPipelineStage, TaskShard, TaskShardPartition, TaskSpec, TaskTemplate, TopologySnapshot,
 };
 use plurifold_scheduler::{
     FusionAdvisor, PlacementBreakdown, ScheduleError, TopologyAwareScheduler,
@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const MAX_AUTO_SHARDS: u32 = 256;
+const MAX_REDUCTION_FAN_IN: u32 = 64;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlannedPlacement {
@@ -38,9 +39,24 @@ pub struct PlannedShard {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlannedReduction {
+    pub input_count: usize,
+    pub placement: PlannedPlacement,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PlannedReductionLevel {
+    pub level: u32,
+    pub reducer: String,
+    pub reductions: Vec<PlannedReduction>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PlannedRole {
     pub name: String,
     pub shards: Vec<PlannedShard>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reductions: Vec<PlannedReductionLevel>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -73,6 +89,19 @@ pub(crate) struct ReadyRoleSelection {
 pub(crate) struct ReadyShardSelection {
     pub index: u32,
     pub implementation: String,
+    pub task: TaskSpec,
+    pub resource_id: ResourceId,
+    pub start_ms: f64,
+    pub cost: PlacementBreakdown,
+}
+
+pub(crate) enum ReadyReductionItem {
+    Carry(ObjectId),
+    Reduce(Box<ReadyReductionSelection>),
+}
+
+pub(crate) struct ReadyReductionSelection {
+    pub input_count: usize,
     pub task: TaskSpec,
     pub resource_id: ResourceId,
     pub start_ms: f64,
@@ -202,13 +231,13 @@ fn choose_auto_shards(
     resource_available_ms: &mut HashMap<ResourceId, f64>,
     context: &ShardPlanningContext<'_>,
 ) -> Option<Vec<ReadyShardSelection>> {
-    let partition_bytes = partition_object_size(role, &policy.partition, context.objects)?;
-    let max_shards = if partition_bytes == 0 {
+    let partition_units = partition_units(role, &policy.partition, context.objects)?;
+    let max_shards = if partition_units == 0 {
         1
     } else {
         policy
             .max_shards
-            .min(partition_bytes.min(u32::MAX as u64) as u32)
+            .min(partition_units.min(u32::MAX as u64) as u32)
     };
     let base_availability = resource_available_ms.clone();
     let mut best: Option<(Vec<ReadyShardSelection>, HashMap<ResourceId, f64>, f64)> = None;
@@ -358,22 +387,19 @@ fn instantiate_shard_task(
     Some(task)
 }
 
-fn partition_object_size(
+fn partition_units(
     role: &plurifold_core::LogicalRoleSpec,
     partition: &ShardPartitionSpec,
     objects: &HashMap<ObjectId, ObjectMetadata>,
 ) -> Option<u64> {
     let template = &role.implementations.first()?.task;
-    let object_id = partition_object_id(template, partition)?;
-    Some(objects.get(&object_id)?.size_bytes)
-}
-
-fn partition_object_id(
-    template: &TaskTemplate,
-    partition: &ShardPartitionSpec,
-) -> Option<ObjectId> {
+    let object_id = template.inputs.get(partition.input())?;
+    let object = objects.get(object_id)?;
     match partition {
-        ShardPartitionSpec::ByteRange { input } => template.inputs.get(*input).copied(),
+        ShardPartitionSpec::ByteRange { .. } => Some(object.size_bytes),
+        ShardPartitionSpec::Records { offsets, .. } => {
+            valid_record_offsets(offsets, object.size_bytes).then_some((offsets.len() - 1) as u64)
+        }
     }
 }
 
@@ -396,7 +422,36 @@ fn concrete_partition(
                 total_bytes,
             })
         }
+        ShardPartitionSpec::Records { input, offsets } => {
+            let object_id = template.inputs.get(*input)?;
+            let total_bytes = objects.get(object_id)?.size_bytes;
+            if !valid_record_offsets(offsets, total_bytes) {
+                return None;
+            }
+            let total_records = (offsets.len() - 1) as u64;
+            let (record_start, record_count) = partition_bounds(total_records, index, count);
+            let first = usize::try_from(record_start).ok()?;
+            let last = usize::try_from(record_start.checked_add(record_count)?).ok()?;
+            let offset = *offsets.get(first)?;
+            let end = *offsets.get(last)?;
+            Some(TaskShardPartition::Records {
+                input: *input,
+                record_start,
+                record_count,
+                total_records,
+                offset,
+                length: end.checked_sub(offset)?,
+                total_bytes,
+            })
+        }
     }
+}
+
+fn valid_record_offsets(offsets: &[u64], total_bytes: u64) -> bool {
+    offsets.len() >= 2
+        && offsets.first() == Some(&0)
+        && offsets.last() == Some(&total_bytes)
+        && offsets.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 fn partition_bounds(total: u64, index: u32, count: u32) -> (u64, u64) {
@@ -410,27 +465,149 @@ fn scale_auto_shard_cost(
     partition: &TaskShardPartition,
     policy: &AutoShardPolicy,
 ) {
-    let TaskShardPartition::ByteRange {
-        offset,
-        length,
-        total_bytes,
-        ..
-    } = partition;
-    let fraction = if *total_bytes == 0 {
-        1.0
-    } else {
-        *length as f64 / *total_bytes as f64
-    };
+    let fraction = partition.work_fraction();
     task.cost.compute_ms_on_reference =
         task.cost.compute_ms_on_reference * fraction + policy.per_shard_overhead_ms;
-    if *total_bytes == 0 {
-        return;
+    task.cost.output_bytes = partition.scaled_output_bytes(task.cost.output_bytes);
+}
+
+pub(crate) fn select_reduction_level(
+    reduction: &RoleReductionSpec,
+    inputs: &[ObjectId],
+    dependency_ready_ms: f64,
+    resource_available_ms: &mut HashMap<ResourceId, f64>,
+    context: &ShardPlanningContext<'_>,
+) -> Option<Vec<ReadyReductionItem>> {
+    if inputs.len() <= 1 {
+        return Some(
+            inputs
+                .iter()
+                .copied()
+                .map(ReadyReductionItem::Carry)
+                .collect(),
+        );
     }
-    let output_start =
-        (task.cost.output_bytes as u128 * *offset as u128 / *total_bytes as u128) as u64;
-    let output_end = (task.cost.output_bytes as u128 * (*offset + *length) as u128
-        / *total_bytes as u128) as u64;
-    task.cost.output_bytes = output_end - output_start;
+    if reduction.max_fan_in < 2
+        || !reduction.locality_rtt_ms.is_finite()
+        || reduction.locality_rtt_ms < 0.0
+    {
+        return None;
+    }
+    let groups = reduction_groups(
+        inputs,
+        reduction.max_fan_in as usize,
+        reduction.locality_rtt_ms,
+        context.objects,
+        context.topology,
+    );
+    let mut items = Vec::with_capacity(groups.len());
+    for group in groups {
+        if group.len() == 1 {
+            items.push(ReadyReductionItem::Carry(group[0]));
+            continue;
+        }
+        let task = reduction.task.instantiate(group.iter().copied());
+        let mut best: Option<ReadyReductionSelection> = None;
+        for resource in context.resources {
+            let Some(cost) = placement_cost(
+                context.scheduler,
+                &task,
+                resource,
+                context.objects,
+                context.topology,
+            ) else {
+                continue;
+            };
+            let start_ms = dependency_ready_ms.max(
+                resource_available_ms
+                    .get(&resource.id)
+                    .copied()
+                    .unwrap_or(0.0),
+            );
+            let finish_ms = start_ms + cost.total_ms;
+            let replace = best
+                .as_ref()
+                .map(|current| {
+                    match finish_ms.total_cmp(&(current.start_ms + current.cost.total_ms)) {
+                        Ordering::Less => true,
+                        Ordering::Equal => cost.total_ms < current.cost.total_ms,
+                        Ordering::Greater => false,
+                    }
+                })
+                .unwrap_or(true);
+            if replace {
+                best = Some(ReadyReductionSelection {
+                    input_count: group.len(),
+                    task: task.clone(),
+                    resource_id: resource.id,
+                    start_ms,
+                    cost,
+                });
+            }
+        }
+        let selected = best?;
+        resource_available_ms.insert(
+            selected.resource_id,
+            selected.start_ms + selected.cost.total_ms,
+        );
+        items.push(ReadyReductionItem::Reduce(Box::new(selected)));
+    }
+    Some(items)
+}
+
+fn reduction_groups(
+    inputs: &[ObjectId],
+    max_fan_in: usize,
+    locality_rtt_ms: f64,
+    objects: &HashMap<ObjectId, ObjectMetadata>,
+    topology: &TopologySnapshot,
+) -> Vec<Vec<ObjectId>> {
+    let mut local_groups = Vec::<Vec<ObjectId>>::new();
+    let mut current = Vec::<ObjectId>::new();
+    for input in inputs.iter().copied() {
+        let extend = !current.is_empty()
+            && current.len() < max_fan_in
+            && current.iter().copied().all(|existing| {
+                reduction_inputs_are_local(existing, input, locality_rtt_ms, objects, topology)
+            });
+        if !current.is_empty() && !extend {
+            local_groups.push(std::mem::take(&mut current));
+        }
+        current.push(input);
+    }
+    if !current.is_empty() {
+        local_groups.push(current);
+    }
+    if local_groups.iter().any(|group| group.len() > 1) {
+        return local_groups;
+    }
+    inputs
+        .chunks(max_fan_in)
+        .map(|chunk| chunk.to_vec())
+        .collect()
+}
+
+fn reduction_inputs_are_local(
+    left: ObjectId,
+    right: ObjectId,
+    locality_rtt_ms: f64,
+    objects: &HashMap<ObjectId, ObjectMetadata>,
+    topology: &TopologySnapshot,
+) -> bool {
+    let Some(left) = objects.get(&left) else {
+        return false;
+    };
+    let Some(right) = objects.get(&right) else {
+        return false;
+    };
+    left.locations.iter().any(|left_resource| {
+        right.locations.iter().any(|right_resource| {
+            left_resource == right_resource
+                || topology
+                    .link(*left_resource, *right_resource)
+                    .is_some_and(|link| link.rtt_ms <= locality_rtt_ms)
+        })
+    })
 }
 
 pub(crate) fn select_ready_fusion(
@@ -865,6 +1042,44 @@ fn pipeline_external_bindings(
         .collect()
 }
 
+pub(crate) fn validate_logical_job_objects(
+    spec: &LogicalJobSpec,
+    objects: &HashMap<ObjectId, ObjectMetadata>,
+) -> Result<(), PlanError> {
+    for role in &spec.roles {
+        let Some(policy) = role.shards.auto() else {
+            continue;
+        };
+        let ShardPartitionSpec::Records { input, offsets } = &policy.partition else {
+            continue;
+        };
+        let object_id = role
+            .implementations
+            .first()
+            .and_then(|implementation| implementation.task.inputs.get(*input))
+            .copied()
+            .ok_or_else(|| {
+                PlanError::InvalidLogicalJob(format!(
+                    "role {} record partition input {} is missing",
+                    role.name, input
+                ))
+            })?;
+        let object = objects.get(&object_id).ok_or_else(|| {
+            PlanError::InvalidLogicalJob(format!(
+                "role {} record partition requires published object {object_id}",
+                role.name
+            ))
+        })?;
+        if !valid_record_offsets(offsets, object.size_bytes) {
+            return Err(PlanError::InvalidLogicalJob(format!(
+                "role {} record offsets must end at object size {}",
+                role.name, object.size_bytes
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn plan(
     spec: &LogicalJobSpec,
     scheduler: &TopologyAwareScheduler,
@@ -873,6 +1088,7 @@ pub(crate) fn plan(
     topology: &TopologySnapshot,
 ) -> Result<CooperativePlan, PlanError> {
     validate_logical_job(spec)?;
+    validate_logical_job_objects(spec, objects)?;
 
     let mut predicted_objects = objects.clone();
     let mut selected = HashMap::<String, SelectedRole>::new();
@@ -973,12 +1189,90 @@ pub(crate) fn plan(
             });
         }
 
+        let mut planned_reductions = Vec::new();
+        if let Some(reduction) = &role.reduction {
+            let mut level = 0u32;
+            while outputs.len() > 1 {
+                let level_ready_ms = finish_ms;
+                let Some(items) = select_reduction_level(
+                    reduction,
+                    &outputs,
+                    level_ready_ms,
+                    &mut resource_available_ms,
+                    &ShardPlanningContext {
+                        scheduler,
+                        resources,
+                        objects: &predicted_objects,
+                        topology,
+                    },
+                ) else {
+                    return Err(PlanError::NoFeasibleImplementation(role.name.clone()));
+                };
+                let mut next_outputs = Vec::with_capacity(items.len());
+                let mut reductions = Vec::new();
+                let mut level_finish_ms = level_ready_ms;
+                let before = outputs.len();
+                for item in items {
+                    match item {
+                        ReadyReductionItem::Carry(object) => next_outputs.push(object),
+                        ReadyReductionItem::Reduce(reduction_selection) => {
+                            let reduction_finish_ms =
+                                reduction_selection.start_ms + reduction_selection.cost.total_ms;
+                            level_finish_ms = level_finish_ms.max(reduction_finish_ms);
+                            let output = ObjectId::new();
+                            predicted_objects.insert(
+                                output,
+                                ObjectMetadata {
+                                    id: output,
+                                    size_bytes: reduction_selection.task.cost.output_bytes,
+                                    digest: None,
+                                    encoding: None,
+                                    locations: vec![reduction_selection.resource_id],
+                                    producer: None,
+                                },
+                            );
+                            next_outputs.push(output);
+                            reductions.push(PlannedReduction {
+                                input_count: reduction_selection.input_count,
+                                placement: PlannedPlacement {
+                                    resource_id: reduction_selection.resource_id,
+                                    start_ms: reduction_selection.start_ms,
+                                    finish_ms: reduction_finish_ms,
+                                    compute_ms: reduction_selection.cost.compute_ms,
+                                    input_transfer_ms: reduction_selection.cost.input_transfer_ms,
+                                    queue_ms: reduction_selection.cost.queue_ms,
+                                    startup_ms: reduction_selection.cost.startup_ms,
+                                    risk_penalty_ms: reduction_selection.cost.risk_penalty_ms,
+                                    total_ms: reduction_selection.cost.total_ms,
+                                },
+                            });
+                        }
+                    }
+                }
+                if next_outputs.len() >= before {
+                    return Err(PlanError::InvalidLogicalJob(format!(
+                        "role {} reduction made no progress",
+                        role.name
+                    )));
+                }
+                outputs = next_outputs;
+                finish_ms = level_finish_ms;
+                planned_reductions.push(PlannedReductionLevel {
+                    level,
+                    reducer: reduction.name.clone(),
+                    reductions,
+                });
+                level += 1;
+            }
+        }
+
         selected.insert(role.name.clone(), SelectedRole { outputs, finish_ms });
         planned_roles.insert(
             role.name.clone(),
             PlannedRole {
                 name: role.name.clone(),
                 shards: planned_shards,
+                reductions: planned_reductions,
             },
         );
     }
@@ -1089,6 +1383,44 @@ pub(crate) fn validate_logical_job(spec: &LogicalJobSpec) -> Result<(), PlanErro
             }
             ShardPolicy::Fixed(_) => {}
         }
+        if let Some(reduction) = &role.reduction {
+            if role.shards.fixed_count() == Some(1) {
+                return Err(PlanError::InvalidLogicalJob(format!(
+                    "role {} cannot reduce an unsharded fixed role",
+                    role.name
+                )));
+            }
+            if reduction.name.trim().is_empty() {
+                return Err(PlanError::InvalidLogicalJob(format!(
+                    "role {} reduction name cannot be empty",
+                    role.name
+                )));
+            }
+            if reduction.max_fan_in < 2 || reduction.max_fan_in > MAX_REDUCTION_FAN_IN {
+                return Err(PlanError::InvalidLogicalJob(format!(
+                    "role {} reduction max_fan_in must be between 2 and {MAX_REDUCTION_FAN_IN}",
+                    role.name
+                )));
+            }
+            if !reduction.locality_rtt_ms.is_finite() || reduction.locality_rtt_ms < 0.0 {
+                return Err(PlanError::InvalidLogicalJob(format!(
+                    "role {} reduction locality_rtt_ms must be finite and non-negative",
+                    role.name
+                )));
+            }
+            if !reduction.task.inputs.is_empty() {
+                return Err(PlanError::InvalidLogicalJob(format!(
+                    "role {} reduction task cannot declare static inputs",
+                    role.name
+                )));
+            }
+            if reduction.task.effects != EffectSemantics::Pure {
+                return Err(PlanError::InvalidLogicalJob(format!(
+                    "role {} reduction task must be Pure",
+                    role.name
+                )));
+            }
+        }
         if role.implementations.is_empty() {
             return Err(PlanError::InvalidLogicalJob(format!(
                 "role {} has no implementations",
@@ -1096,9 +1428,18 @@ pub(crate) fn validate_logical_job(spec: &LogicalJobSpec) -> Result<(), PlanErro
             )));
         }
         if let Some(policy) = role.shards.auto() {
-            let input_index = match policy.partition {
-                ShardPartitionSpec::ByteRange { input } => input,
-            };
+            let input_index = policy.partition.input();
+            if let ShardPartitionSpec::Records { offsets, .. } = &policy.partition {
+                if offsets.len() < 2
+                    || offsets.first() != Some(&0)
+                    || !offsets.windows(2).all(|pair| pair[0] < pair[1])
+                {
+                    return Err(PlanError::InvalidLogicalJob(format!(
+                        "role {} record offsets must start at 0 and be strictly increasing",
+                        role.name
+                    )));
+                }
+            }
             let expected_input = role.implementations[0]
                 .task
                 .inputs
@@ -1213,7 +1554,8 @@ mod tests {
 
     use plurifold_core::{
         Architecture, AutoShardPolicy, CostHint, EffectSemantics, LinkProfile, LogicalRoleSpec,
-        ResourceRequirements, RoleImplementation, ShardPartitionSpec, ShardPolicy, ShardPolicySpec,
+        ResourceRequirements, RoleImplementation, RoleReductionSpec, ShardPartitionSpec,
+        ShardPolicy, ShardPolicySpec,
     };
 
     use super::*;
@@ -1274,6 +1616,7 @@ mod tests {
                 ],
                 depends_on: vec![],
                 shards: 1.into(),
+                reduction: None,
             }],
             outputs: vec!["compute".into()],
         };
@@ -1311,6 +1654,7 @@ mod tests {
                     )],
                     depends_on: vec![],
                     shards: 1.into(),
+                    reduction: None,
                 },
                 LogicalRoleSpec {
                     name: "small".into(),
@@ -1322,6 +1666,7 @@ mod tests {
                     )],
                     depends_on: vec![],
                     shards: 1.into(),
+                    reduction: None,
                 },
                 LogicalRoleSpec {
                     name: "join".into(),
@@ -1331,6 +1676,7 @@ mod tests {
                     ],
                     depends_on: vec!["large".into(), "small".into()],
                     shards: 1.into(),
+                    reduction: None,
                 },
             ],
             outputs: vec!["join".into()],
@@ -1385,6 +1731,7 @@ mod tests {
             }],
             depends_on: vec![],
             shards: 1.into(),
+            reduction: None,
         };
         let logical = LogicalJobSpec {
             id: Default::default(),
@@ -1424,6 +1771,7 @@ mod tests {
                 implementations: vec![implementation("worker", "shard:work", 1_000.0, 4)],
                 depends_on: vec![],
                 shards: 3.into(),
+                reduction: None,
             }],
             outputs: vec!["map".into()],
         };
@@ -1466,6 +1814,7 @@ mod tests {
                 ],
                 depends_on: vec![],
                 shards: 2.into(),
+                reduction: None,
             }],
             outputs: vec!["map".into()],
         };
@@ -1524,6 +1873,7 @@ mod tests {
                 per_shard_overhead_ms: 0.0,
                 min_gain_ratio: 0.05,
             })),
+            reduction: None,
         };
         let objects = HashMap::from([(
             input,
@@ -1582,6 +1932,330 @@ mod tests {
     }
 
     #[test]
+    fn reduction_locality_does_not_merge_a_chain_with_a_distant_endpoint() {
+        let a = ResourceId::new();
+        let b = ResourceId::new();
+        let c = ResourceId::new();
+        let oa = ObjectId::new();
+        let ob = ObjectId::new();
+        let oc = ObjectId::new();
+        let objects = HashMap::from([
+            (
+                oa,
+                ObjectMetadata {
+                    id: oa,
+                    size_bytes: 8,
+                    digest: None,
+                    encoding: None,
+                    locations: vec![a],
+                    producer: None,
+                },
+            ),
+            (
+                ob,
+                ObjectMetadata {
+                    id: ob,
+                    size_bytes: 8,
+                    digest: None,
+                    encoding: None,
+                    locations: vec![b],
+                    producer: None,
+                },
+            ),
+            (
+                oc,
+                ObjectMetadata {
+                    id: oc,
+                    size_bytes: 8,
+                    digest: None,
+                    encoding: None,
+                    locations: vec![c],
+                    producer: None,
+                },
+            ),
+        ]);
+        let topology = TopologySnapshot {
+            links: vec![
+                LinkProfile {
+                    from: a,
+                    to: b,
+                    rtt_ms: 0.1,
+                    bandwidth_mbps: 10_000.0,
+                },
+                LinkProfile {
+                    from: b,
+                    to: c,
+                    rtt_ms: 0.1,
+                    bandwidth_mbps: 10_000.0,
+                },
+                LinkProfile {
+                    from: a,
+                    to: c,
+                    rtt_ms: 100.0,
+                    bandwidth_mbps: 100.0,
+                },
+            ],
+        };
+        assert_eq!(
+            reduction_groups(&[oa, ob, oc], 3, 1.0, &objects, &topology),
+            vec![vec![oa, ob], vec![oc]]
+        );
+    }
+
+    #[test]
+    fn reduction_level_groups_adjacent_local_outputs_before_cross_domain_fallback() {
+        let a = ResourceId::new();
+        let b = ResourceId::new();
+        let c = ResourceId::new();
+        let oa = ObjectId::new();
+        let ob = ObjectId::new();
+        let oc = ObjectId::new();
+        let objects = HashMap::from([
+            (
+                oa,
+                ObjectMetadata {
+                    id: oa,
+                    size_bytes: 8,
+                    digest: None,
+                    encoding: None,
+                    locations: vec![a],
+                    producer: None,
+                },
+            ),
+            (
+                ob,
+                ObjectMetadata {
+                    id: ob,
+                    size_bytes: 8,
+                    digest: None,
+                    encoding: None,
+                    locations: vec![b],
+                    producer: None,
+                },
+            ),
+            (
+                oc,
+                ObjectMetadata {
+                    id: oc,
+                    size_bytes: 8,
+                    digest: None,
+                    encoding: None,
+                    locations: vec![c],
+                    producer: None,
+                },
+            ),
+        ]);
+        let topology = TopologySnapshot {
+            links: vec![
+                LinkProfile {
+                    from: a,
+                    to: b,
+                    rtt_ms: 0.1,
+                    bandwidth_mbps: 10_000.0,
+                },
+                LinkProfile {
+                    from: a,
+                    to: c,
+                    rtt_ms: 100.0,
+                    bandwidth_mbps: 100.0,
+                },
+                LinkProfile {
+                    from: b,
+                    to: c,
+                    rtt_ms: 100.0,
+                    bandwidth_mbps: 100.0,
+                },
+            ],
+        };
+        let resources = [
+            resource(a, 1.0, "reduce"),
+            resource(b, 1.0, "reduce"),
+            resource(c, 1.0, "reduce"),
+        ];
+        let reduction = RoleReductionSpec {
+            name: "sum".into(),
+            task: TaskTemplate {
+                artifact: "builtin:sum-u64".into(),
+                entrypoint: "run".into(),
+                arguments: vec![],
+                inputs: vec![],
+                requirements: ResourceRequirements {
+                    required_features: BTreeSet::from(["reduce".into()]),
+                    ..ResourceRequirements::default()
+                },
+                effects: EffectSemantics::Pure,
+                cost: CostHint {
+                    compute_ms_on_reference: 10.0,
+                    output_bytes: 8,
+                },
+            },
+            max_fan_in: 2,
+            locality_rtt_ms: 1.0,
+        };
+        let context = ShardPlanningContext {
+            scheduler: &TopologyAwareScheduler::default(),
+            resources: &resources,
+            objects: &objects,
+            topology: &topology,
+        };
+        let mut availability = HashMap::new();
+        let level =
+            select_reduction_level(&reduction, &[oa, ob, oc], 0.0, &mut availability, &context)
+                .unwrap();
+        assert_eq!(level.len(), 2);
+        match &level[0] {
+            ReadyReductionItem::Reduce(selected) => {
+                assert_eq!(selected.input_count, 2);
+                assert_eq!(selected.task.inputs, vec![oa, ob]);
+                assert!(selected.resource_id == a || selected.resource_id == b);
+            }
+            ReadyReductionItem::Carry(_) => panic!("local A/B pair should reduce"),
+        }
+        assert!(matches!(level[1], ReadyReductionItem::Carry(object) if object == oc));
+    }
+
+    #[test]
+    fn record_partition_object_size_mismatch_is_rejected() {
+        let input = ObjectId::new();
+        let spec = LogicalJobSpec {
+            id: plurifold_core::JobId::new(),
+            roles: vec![LogicalRoleSpec {
+                name: "records".into(),
+                implementations: vec![RoleImplementation {
+                    name: "worker".into(),
+                    task: TaskTemplate {
+                        artifact: "builtin:identity".into(),
+                        entrypoint: "run".into(),
+                        arguments: vec![],
+                        inputs: vec![input],
+                        requirements: ResourceRequirements::default(),
+                        effects: EffectSemantics::Pure,
+                        cost: CostHint::default(),
+                    },
+                }],
+                depends_on: vec![],
+                shards: ShardPolicy::Policy(ShardPolicySpec::Auto(AutoShardPolicy {
+                    max_shards: 2,
+                    partition: ShardPartitionSpec::Records {
+                        input: 0,
+                        offsets: vec![0, 4, 9],
+                    },
+                    per_shard_overhead_ms: 0.0,
+                    min_gain_ratio: 0.05,
+                })),
+                reduction: None,
+            }],
+            outputs: vec!["records".into()],
+        };
+        let objects = HashMap::from([(
+            input,
+            ObjectMetadata {
+                id: input,
+                size_bytes: 10,
+                digest: Some("sha256:record-layout".into()),
+                encoding: None,
+                locations: vec![],
+                producer: None,
+            },
+        )]);
+        assert!(matches!(
+            validate_logical_job_objects(&spec, &objects),
+            Err(PlanError::InvalidLogicalJob(message))
+                if message.contains("record offsets must end at object size 10")
+        ));
+    }
+
+    #[test]
+    fn record_partitioning_preserves_boundaries_and_scales_work_by_record_count() {
+        let first = ResourceId::new();
+        let second = ResourceId::new();
+        let input = ObjectId::new();
+        let role = LogicalRoleSpec {
+            name: "records".into(),
+            implementations: vec![RoleImplementation {
+                name: "worker".into(),
+                task: TaskTemplate {
+                    artifact: "builtin:identity".into(),
+                    entrypoint: "run".into(),
+                    arguments: vec![],
+                    inputs: vec![input],
+                    requirements: ResourceRequirements {
+                        required_features: BTreeSet::from(["records:work".into()]),
+                        ..ResourceRequirements::default()
+                    },
+                    effects: EffectSemantics::Pure,
+                    cost: CostHint {
+                        compute_ms_on_reference: 400.0,
+                        output_bytes: 100,
+                    },
+                },
+            }],
+            depends_on: vec![],
+            shards: ShardPolicy::Policy(ShardPolicySpec::Auto(AutoShardPolicy {
+                max_shards: 2,
+                partition: ShardPartitionSpec::Records {
+                    input: 0,
+                    offsets: vec![0, 2, 8, 9, 12],
+                },
+                per_shard_overhead_ms: 0.0,
+                min_gain_ratio: 0.0,
+            })),
+            reduction: None,
+        };
+        let objects = HashMap::from([(
+            input,
+            ObjectMetadata {
+                id: input,
+                size_bytes: 12,
+                digest: None,
+                encoding: None,
+                locations: vec![first, second],
+                producer: None,
+            },
+        )]);
+        let resources = [
+            resource(first, 1.0, "records:work"),
+            resource(second, 1.0, "records:work"),
+        ];
+        let context = ShardPlanningContext {
+            scheduler: &TopologyAwareScheduler::default(),
+            resources: &resources,
+            objects: &objects,
+            topology: &TopologySnapshot::default(),
+        };
+        let shards = select_ready_shards(&role, &[], &context).unwrap();
+        assert_eq!(shards.len(), 2);
+        assert_eq!(shards[0].task.cost.compute_ms_on_reference, 200.0);
+        assert_eq!(shards[1].task.cost.compute_ms_on_reference, 200.0);
+        assert_eq!(shards[0].task.cost.output_bytes, 50);
+        assert_eq!(shards[1].task.cost.output_bytes, 50);
+        assert_eq!(
+            shards[0].task.shard.as_ref().unwrap().partition,
+            Some(TaskShardPartition::Records {
+                input: 0,
+                record_start: 0,
+                record_count: 2,
+                total_records: 4,
+                offset: 0,
+                length: 8,
+                total_bytes: 12,
+            })
+        );
+        assert_eq!(
+            shards[1].task.shard.as_ref().unwrap().partition,
+            Some(TaskShardPartition::Records {
+                input: 0,
+                record_start: 2,
+                record_count: 2,
+                total_records: 4,
+                offset: 8,
+                length: 4,
+                total_bytes: 12,
+            })
+        );
+    }
+
+    #[test]
     fn auto_sharding_stays_single_when_remote_topology_is_too_expensive() {
         let local = ResourceId::new();
         let remote = ResourceId::new();
@@ -1613,6 +2287,7 @@ mod tests {
                 per_shard_overhead_ms: 0.0,
                 min_gain_ratio: 0.05,
             })),
+            reduction: None,
         };
         let objects = HashMap::from([(
             input,

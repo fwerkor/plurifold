@@ -212,6 +212,8 @@ wait_http "$COORD/healthz"
   --feature demo:shard \
   --feature demo:shard-join \
   --feature auto:worker-a \
+  --feature records:worker-a \
+  --feature records:reduce \
   --feature fusion:producer \
   --feature fusion:middle \
   --feature fusion:consumer \
@@ -232,6 +234,8 @@ PIDS+=("$A_PID")
   --feature demo:role-right \
   --feature demo:shard \
   --feature auto:worker-b \
+  --feature records:worker-b \
+  --feature records:reduce \
   --coordinator "$COORD" \
   --bind "127.0.0.1:${B_PORT}" \
   --advertise "$B_URL" \
@@ -565,6 +569,8 @@ done
   --feature demo:join-fast \
   --feature demo:shard \
   --feature auto:worker-c \
+  --feature records:worker-c \
+  --feature records:reduce \
   --feature fusion:middle \
   --feature fusion:consumer \
   --coordinator "$COORD" \
@@ -841,6 +847,191 @@ assert "Completed" in role["status"], role
 assert len(role["status"]["Completed"])==3, role
 '
 echo "auto-sharding: chose 3 A/B/C byte ranges, range-fetched remotely, and reconstructed the original object"
+
+./target/debug/plurifold link --coordinator "$COORD" --from "$A_ID" --to "$B_ID" \
+  --rtt-ms 0.1 --bandwidth-mbps 10000
+./target/debug/plurifold link --coordinator "$COORD" --from "$A_ID" --to "$C_ID" \
+  --rtt-ms 100 --bandwidth-mbps 100
+./target/debug/plurifold link --coordinator "$COORD" --from "$B_ID" --to "$C_ID" \
+  --rtt-ms 100 --bandwidth-mbps 100
+
+python3 - <<'PYDATA' "$TMP/records-input" "$TMP/record-offsets.json" "$TMP/record-sum.txt"
+import json,sys
+values=[1,20,300,4,50,6000,7,80,900,10,1100,12]
+payload=b""
+offsets=[0]
+for value in values:
+    payload += f"{value}\n".encode()
+    offsets.append(len(payload))
+open(sys.argv[1],"wb").write(payload)
+json.dump(offsets,open(sys.argv[2],"w"))
+open(sys.argv[3],"w").write(str(sum(values)))
+PYDATA
+RECORD_OFFSETS=$(cat "$TMP/record-offsets.json")
+RECORD_SUM=$(cat "$TMP/record-sum.txt")
+RECORD_INPUT_DIGEST=$(sha256sum "$TMP/records-input" | awk '{print $1}')
+RECORD_OBJ=$(./target/debug/plurifold put \
+  --coordinator "$COORD" --agent "$A_URL" --file "$TMP/records-input")
+cat >"$TMP/record-reduction-job.json" <<JSON
+{
+  "roles": [
+    {
+      "name": "sum-records",
+      "implementations": [
+        {
+          "name": "records-a",
+          "task": {
+            "artifact": "builtin:sum-records-u64",
+            "entrypoint": "run",
+            "arguments": ["700"],
+            "inputs": ["$RECORD_OBJ"],
+            "requirements": {
+              "architecture": null,
+              "min_memory_bytes": 0,
+              "accelerator": null,
+              "required_features": ["records:worker-a"]
+            },
+            "effects": "Pure",
+            "cost": {"compute_ms_on_reference": 6000.0, "output_bytes": 24}
+          }
+        },
+        {
+          "name": "records-b",
+          "task": {
+            "artifact": "builtin:sum-records-u64",
+            "entrypoint": "run",
+            "arguments": ["700"],
+            "inputs": ["$RECORD_OBJ"],
+            "requirements": {
+              "architecture": null,
+              "min_memory_bytes": 0,
+              "accelerator": null,
+              "required_features": ["records:worker-b"]
+            },
+            "effects": "Pure",
+            "cost": {"compute_ms_on_reference": 3000.0, "output_bytes": 24}
+          }
+        },
+        {
+          "name": "records-c",
+          "task": {
+            "artifact": "builtin:sum-records-u64",
+            "entrypoint": "run",
+            "arguments": ["700"],
+            "inputs": ["$RECORD_OBJ"],
+            "requirements": {
+              "architecture": null,
+              "min_memory_bytes": 0,
+              "accelerator": null,
+              "required_features": ["records:worker-c"]
+            },
+            "effects": "Pure",
+            "cost": {"compute_ms_on_reference": 60000.0, "output_bytes": 24}
+          }
+        }
+      ],
+      "depends_on": [],
+      "shards": {
+        "mode": "auto",
+        "max_shards": 3,
+        "partition": {"kind": "records", "input": 0, "offsets": $RECORD_OFFSETS},
+        "per_shard_overhead_ms": 0.0,
+        "min_gain_ratio": 0.05
+      },
+      "reduction": {
+        "name": "sum-u64",
+        "task": {
+          "artifact": "builtin:sum-u64",
+          "entrypoint": "run",
+          "arguments": ["700"],
+          "requirements": {
+            "architecture": null,
+            "min_memory_bytes": 0,
+            "accelerator": null,
+            "required_features": ["records:reduce"]
+          },
+          "effects": "Pure",
+          "cost": {"compute_ms_on_reference": 100.0, "output_bytes": 8}
+        },
+        "max_fan_in": 2,
+        "locality_rtt_ms": 1.0
+      }
+    }
+  ],
+  "outputs": ["sum-records"]
+}
+JSON
+
+RECORD_PLAN=$(./target/debug/plurifold job plan \
+  --coordinator "$COORD" --file "$TMP/record-reduction-job.json")
+printf '%s' "$RECORD_PLAN" | python3 -c 'import json,sys
+plan=json.load(sys.stdin)
+role=plan["roles"][0]
+assert len(role["shards"])==3, role
+assert [s["placement"]["resource_id"] for s in role["shards"]]==sys.argv[1:4], role
+parts=[s["partition"] for s in role["shards"]]
+assert [p["kind"] for p in parts]==["records"]*3, parts
+assert [p["record_start"] for p in parts]==[0,4,8], parts
+assert [p["record_count"] for p in parts]==[4,4,4], parts
+assert all(p["total_records"]==12 for p in parts), parts
+assert len(role["reductions"])==2, role
+assert len(role["reductions"][0]["reductions"])==1, role["reductions"]
+assert role["reductions"][0]["reductions"][0]["input_count"]==2, role["reductions"]
+assert role["reductions"][0]["reductions"][0]["placement"]["resource_id"] in sys.argv[1:3], role["reductions"]
+assert len(role["reductions"][1]["reductions"])==1, role["reductions"]
+' "$A_ID" "$B_ID" "$C_ID"
+
+RECORD_JOB=$(./target/debug/plurifold job auto-submit \
+  --coordinator "$COORD" --file "$TMP/record-reduction-job.json")
+RECORD_LEVEL0=""
+for _ in $(seq 1 160); do
+  RECORD_VIEW=$(./target/debug/plurifold job status --coordinator "$COORD" --job "$RECORD_JOB")
+  RECORD_LEVEL0=$(printf '%s' "$RECORD_VIEW" | python3 -c 'import json,sys
+role=json.load(sys.stdin)["roles"][0]
+status=role["status"]
+if isinstance(status,dict) and "Reducing" in status and status["Reducing"]["level"]==0:
+    tasks=status["Reducing"]["tasks"]
+    if len(tasks)==1:
+        print(tasks[0])')
+  [[ -n "$RECORD_LEVEL0" ]] && break
+  sleep 0.05
+done
+[[ -n "$RECORD_LEVEL0" ]]
+RECORD_LEVEL0_VIEW=$(./target/debug/plurifold status --coordinator "$COORD" --task "$RECORD_LEVEL0")
+printf '%s' "$RECORD_LEVEL0_VIEW" | python3 -c 'import json,sys
+task=json.load(sys.stdin)["task"]
+assert task["artifact"]=="builtin:sum-u64", task
+assert len(task["inputs"])==2, task
+'
+
+./target/debug/plurifold job wait \
+  --coordinator "$COORD" --job "$RECORD_JOB" --timeout-s 15 >/dev/null
+[[ ! -f "$TMP/b/sha256/$RECORD_INPUT_DIGEST" ]]
+[[ ! -f "$TMP/c/sha256/$RECORD_INPUT_DIGEST" ]]
+RECORD_RESULT_DIGEST=$(python3 - "$RECORD_SUM" <<'PY'
+import hashlib,struct,sys
+value=int(sys.argv[1])
+print(hashlib.sha256(struct.pack("<Q",value)).hexdigest())
+PY
+)
+RECORD_RESULT_PATH=""
+for path in "$TMP/a/sha256/$RECORD_RESULT_DIGEST" "$TMP/b/sha256/$RECORD_RESULT_DIGEST" "$TMP/c/sha256/$RECORD_RESULT_DIGEST"; do
+  [[ -f "$path" ]] && RECORD_RESULT_PATH="$path"
+done
+[[ -n "$RECORD_RESULT_PATH" ]]
+python3 - <<'PY' "$RECORD_RESULT_PATH" "$RECORD_SUM"
+import struct,sys
+value=struct.unpack("<Q",open(sys.argv[1],"rb").read())[0]
+assert value==int(sys.argv[2]),(value,sys.argv[2])
+PY
+echo "record-reduction: record-aligned A/B/C shards reduced locally on A/B before cross-domain final sum=$RECORD_SUM"
+
+./target/debug/plurifold link --coordinator "$COORD" --from "$A_ID" --to "$B_ID" \
+  --rtt-ms 0.1 --bandwidth-mbps 10000
+./target/debug/plurifold link --coordinator "$COORD" --from "$A_ID" --to "$C_ID" \
+  --rtt-ms 0.1 --bandwidth-mbps 10000
+./target/debug/plurifold link --coordinator "$COORD" --from "$B_ID" --to "$C_ID" \
+  --rtt-ms 0.1 --bandwidth-mbps 10000
 
 write_fusion_job "$TMP/fusion-low.json" 1
 LOW_FUSION_JOB=$(./target/debug/plurifold job auto-submit \

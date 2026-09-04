@@ -35,6 +35,11 @@ pub enum CooperativeRoleStatus {
         tasks: Vec<TaskId>,
         completed: usize,
     },
+    Reducing {
+        tasks: Vec<TaskId>,
+        completed: usize,
+        level: u32,
+    },
     Completed(Vec<ObjectId>),
     Uncertain,
 }
@@ -96,6 +101,7 @@ struct CooperativeJobRecord {
     definition: JobDefinition,
     roles: HashMap<String, CooperativeRoleStatus>,
     selections: HashMap<String, RoleSelection>,
+    reductions: HashMap<String, ActiveReduction>,
 }
 
 #[derive(Clone, Debug)]
@@ -119,6 +125,19 @@ struct ShardSelection {
 }
 
 #[derive(Clone, Debug)]
+struct ActiveReduction {
+    level: u32,
+    inputs: Vec<ObjectId>,
+    items: Vec<ReductionItem>,
+}
+
+#[derive(Clone, Debug)]
+enum ReductionItem {
+    Carry(ObjectId),
+    Task(TaskId),
+}
+
+#[derive(Clone, Debug)]
 enum TaskRoleBinding {
     Single {
         job_id: JobId,
@@ -129,6 +148,10 @@ enum TaskRoleBinding {
         role_names: Vec<String>,
     },
     Shard {
+        job_id: JobId,
+        role_name: String,
+    },
+    Reduction {
         job_id: JobId,
         role_name: String,
     },
@@ -361,6 +384,7 @@ impl Fabric {
                 definition: JobDefinition::Cooperative(job),
                 roles,
                 selections: HashMap::new(),
+                reductions: HashMap::new(),
             },
         );
         self.materialize_ready_roles(job_id)?;
@@ -374,6 +398,14 @@ impl Fabric {
                 unreachable!("validation does not place roles")
             }
         })?;
+        planner::validate_logical_job_objects(&job, &self.objects).map_err(
+            |error| match error {
+                PlanError::InvalidLogicalJob(message) => FabricError::InvalidLogicalJob(message),
+                PlanError::NoFeasibleImplementation(_) => {
+                    unreachable!("object validation does not place roles")
+                }
+            },
+        )?;
         let job_id = job.id;
         if self.jobs.contains_key(&job_id) {
             return Err(FabricError::DuplicateJob(job_id));
@@ -389,6 +421,7 @@ impl Fabric {
                 definition: JobDefinition::Logical(job),
                 roles,
                 selections: HashMap::new(),
+                reductions: HashMap::new(),
             },
         );
         self.materialize_ready_roles(job_id)?;
@@ -650,6 +683,15 @@ impl Fabric {
             }
             _ => return Err(FabricError::StaleExecution),
         }
+        if matches!(
+            self.task_roles.get(&lease.task_id),
+            Some(TaskRoleBinding::Reduction { .. })
+        ) && outputs.len() != 1
+        {
+            return Err(FabricError::InvalidLogicalJob(
+                "reduction tasks must produce exactly one output".into(),
+            ));
+        }
         for output in &outputs {
             if let Some(existing) = self.objects.get(&output.id) {
                 if !same_object_identity(existing, output) {
@@ -766,6 +808,21 @@ impl Fabric {
                         all_outputs.extend(outputs.iter().copied());
                     }
                 }
+                if completed == task_ids.len()
+                    && logical_role_reduction(
+                        &self
+                            .jobs
+                            .get(&job_id)
+                            .ok_or(FabricError::UnknownJob(job_id))?
+                            .definition,
+                        &role_name,
+                    )
+                    .is_some()
+                    && all_outputs.len() > 1
+                {
+                    self.start_role_reduction(job_id, &role_name, all_outputs)?;
+                    return Ok(());
+                }
                 let job = self
                     .jobs
                     .get_mut(&job_id)
@@ -785,8 +842,257 @@ impl Fabric {
                 };
                 job_id
             }
+            TaskRoleBinding::Reduction { job_id, role_name } => {
+                if outputs.len() != 1 {
+                    return Err(FabricError::InvalidLogicalJob(format!(
+                        "reduction task for role {role_name} must produce exactly one output"
+                    )));
+                }
+                self.advance_reduction_level(job_id, &role_name)?;
+                return Ok(());
+            }
         };
         self.materialize_ready_roles(job_id)?;
+        Ok(())
+    }
+
+    fn start_role_reduction(
+        &mut self,
+        job_id: JobId,
+        role_name: &str,
+        inputs: Vec<ObjectId>,
+    ) -> Result<(), FabricError> {
+        let job = self
+            .jobs
+            .get_mut(&job_id)
+            .ok_or(FabricError::UnknownJob(job_id))?;
+        job.reductions.insert(
+            role_name.to_owned(),
+            ActiveReduction {
+                level: 0,
+                inputs,
+                items: Vec::new(),
+            },
+        );
+        job.roles.insert(
+            role_name.to_owned(),
+            CooperativeRoleStatus::Reducing {
+                tasks: Vec::new(),
+                completed: 0,
+                level: 0,
+            },
+        );
+        self.materialize_reduction_level(job_id, role_name)
+    }
+
+    fn materialize_reduction_level(
+        &mut self,
+        job_id: JobId,
+        role_name: &str,
+    ) -> Result<(), FabricError> {
+        let (reduction, level, inputs, already_materialized) = {
+            let job = self
+                .jobs
+                .get(&job_id)
+                .ok_or(FabricError::UnknownJob(job_id))?;
+            let reduction = logical_role_reduction(&job.definition, role_name)
+                .cloned()
+                .ok_or_else(|| {
+                    FabricError::InvalidLogicalJob(format!(
+                        "runtime state is missing reduction spec for role {role_name}"
+                    ))
+                })?;
+            let state = job.reductions.get(role_name).ok_or_else(|| {
+                FabricError::InvalidLogicalJob(format!(
+                    "runtime state is missing reduction state for role {role_name}"
+                ))
+            })?;
+            (
+                reduction,
+                state.level,
+                state.inputs.clone(),
+                !state.items.is_empty(),
+            )
+        };
+        if already_materialized {
+            return Ok(());
+        }
+        if inputs.len() <= 1 {
+            let job = self
+                .jobs
+                .get_mut(&job_id)
+                .ok_or(FabricError::UnknownJob(job_id))?;
+            job.reductions.remove(role_name);
+            job.roles.insert(
+                role_name.to_owned(),
+                CooperativeRoleStatus::Completed(inputs),
+            );
+            self.materialize_ready_roles(job_id)?;
+            return Ok(());
+        }
+
+        let resources = self.schedulable_resources();
+        let mut availability = HashMap::<ResourceId, f64>::new();
+        let Some(selected) = planner::select_reduction_level(
+            &reduction,
+            &inputs,
+            0.0,
+            &mut availability,
+            &planner::ShardPlanningContext {
+                scheduler: &self.scheduler,
+                resources: &resources,
+                objects: &self.objects,
+                topology: &self.topology,
+            },
+        ) else {
+            let job = self
+                .jobs
+                .get_mut(&job_id)
+                .ok_or(FabricError::UnknownJob(job_id))?;
+            job.roles.insert(
+                role_name.to_owned(),
+                CooperativeRoleStatus::Reducing {
+                    tasks: Vec::new(),
+                    completed: 0,
+                    level,
+                },
+            );
+            return Ok(());
+        };
+
+        let mut items = Vec::with_capacity(selected.len());
+        let mut task_ids = Vec::new();
+        for item in selected {
+            match item {
+                planner::ReadyReductionItem::Carry(object) => {
+                    items.push(ReductionItem::Carry(object));
+                }
+                planner::ReadyReductionItem::Reduce(selected) => {
+                    let task_id = selected.task.id;
+                    self.submit(selected.task)?;
+                    self.task_roles.insert(
+                        task_id,
+                        TaskRoleBinding::Reduction {
+                            job_id,
+                            role_name: role_name.to_owned(),
+                        },
+                    );
+                    task_ids.push(task_id);
+                    items.push(ReductionItem::Task(task_id));
+                }
+            }
+        }
+        if task_ids.is_empty() {
+            return Err(FabricError::InvalidLogicalJob(format!(
+                "reduction level for role {role_name} made no progress"
+            )));
+        }
+        let job = self
+            .jobs
+            .get_mut(&job_id)
+            .ok_or(FabricError::UnknownJob(job_id))?;
+        let state = job.reductions.get_mut(role_name).ok_or_else(|| {
+            FabricError::InvalidLogicalJob(format!(
+                "runtime state is missing reduction state for role {role_name}"
+            ))
+        })?;
+        state.items = items;
+        job.roles.insert(
+            role_name.to_owned(),
+            CooperativeRoleStatus::Reducing {
+                tasks: task_ids,
+                completed: 0,
+                level,
+            },
+        );
+        Ok(())
+    }
+
+    fn advance_reduction_level(
+        &mut self,
+        job_id: JobId,
+        role_name: &str,
+    ) -> Result<(), FabricError> {
+        let (level, items) = {
+            let job = self
+                .jobs
+                .get(&job_id)
+                .ok_or(FabricError::UnknownJob(job_id))?;
+            let state = job.reductions.get(role_name).ok_or_else(|| {
+                FabricError::InvalidLogicalJob(format!(
+                    "runtime state is missing reduction state for role {role_name}"
+                ))
+            })?;
+            (state.level, state.items.clone())
+        };
+        let mut next_inputs = Vec::with_capacity(items.len());
+        let mut task_ids = Vec::new();
+        let mut completed = 0usize;
+        let mut all_complete = true;
+        for item in items {
+            match item {
+                ReductionItem::Carry(object) => next_inputs.push(object),
+                ReductionItem::Task(task_id) => {
+                    task_ids.push(task_id);
+                    match self.task_status(task_id) {
+                        Some(TaskStatus::Completed(outputs)) if outputs.len() == 1 => {
+                            completed += 1;
+                            next_inputs.push(outputs[0]);
+                        }
+                        Some(TaskStatus::Completed(_)) => {
+                            return Err(FabricError::InvalidLogicalJob(format!(
+                                "reduction task {task_id} for role {role_name} produced an invalid output count"
+                            )));
+                        }
+                        _ => all_complete = false,
+                    }
+                }
+            }
+        }
+        if !all_complete {
+            let job = self
+                .jobs
+                .get_mut(&job_id)
+                .ok_or(FabricError::UnknownJob(job_id))?;
+            job.roles.insert(
+                role_name.to_owned(),
+                CooperativeRoleStatus::Reducing {
+                    tasks: task_ids,
+                    completed,
+                    level,
+                },
+            );
+            return Ok(());
+        }
+        let job = self
+            .jobs
+            .get_mut(&job_id)
+            .ok_or(FabricError::UnknownJob(job_id))?;
+        let state = job.reductions.get_mut(role_name).ok_or_else(|| {
+            FabricError::InvalidLogicalJob(format!(
+                "runtime state is missing reduction state for role {role_name}"
+            ))
+        })?;
+        state.level += 1;
+        state.inputs = next_inputs;
+        state.items.clear();
+        self.materialize_reduction_level(job_id, role_name)
+    }
+
+    fn refresh_reductions(&mut self) -> Result<(), FabricError> {
+        let pending = self
+            .jobs
+            .iter()
+            .flat_map(|(job_id, job)| {
+                job.reductions.iter().filter_map(move |(role_name, state)| {
+                    (state.inputs.len() > 1 && state.items.is_empty())
+                        .then_some((*job_id, role_name.clone()))
+                })
+            })
+            .collect::<Vec<_>>();
+        for (job_id, role_name) in pending {
+            self.materialize_reduction_level(job_id, &role_name)?;
+        }
         Ok(())
     }
 
@@ -813,6 +1119,9 @@ impl Fabric {
             }
             TaskRoleBinding::Shard {
                 job_id, role_name, ..
+            }
+            | TaskRoleBinding::Reduction {
+                job_id, role_name, ..
             } => {
                 if let Some(job) = self.jobs.get_mut(&job_id) {
                     if let Some(status) = job.roles.get_mut(&role_name) {
@@ -824,6 +1133,7 @@ impl Fabric {
     }
 
     pub fn refresh_ready_roles(&mut self) -> Result<(), FabricError> {
+        self.refresh_reductions()?;
         let job_ids = self.jobs.keys().copied().collect::<Vec<_>>();
         for job_id in job_ids {
             self.materialize_ready_roles(job_id)?;
@@ -1086,6 +1396,20 @@ impl Fabric {
     }
 }
 
+fn logical_role_reduction<'a>(
+    definition: &'a JobDefinition,
+    role_name: &str,
+) -> Option<&'a plurifold_core::RoleReductionSpec> {
+    match definition {
+        JobDefinition::Logical(spec) => spec
+            .roles
+            .iter()
+            .find(|role| role.name == role_name)
+            .and_then(|role| role.reduction.as_ref()),
+        JobDefinition::Cooperative(_) => None,
+    }
+}
+
 fn job_outputs(definition: &JobDefinition) -> &[String] {
     match definition {
         JobDefinition::Cooperative(spec) => &spec.outputs,
@@ -1176,20 +1500,43 @@ fn validate_task(task: &TaskSpec) -> Result<(), FabricError> {
                 shard.index, shard.count
             )));
         }
-        if let Some(plurifold_core::TaskShardPartition::ByteRange {
-            input,
-            offset,
-            length,
-            total_bytes,
-        }) = &shard.partition
-        {
-            if *input >= task.inputs.len()
-                || offset.checked_add(*length).is_none()
-                || offset.saturating_add(*length) > *total_bytes
-            {
-                return Err(FabricError::InvalidTask(
-                    "invalid shard byte-range partition".into(),
-                ));
+        if let Some(partition) = &shard.partition {
+            match partition {
+                plurifold_core::TaskShardPartition::ByteRange {
+                    input,
+                    offset,
+                    length,
+                    total_bytes,
+                } => {
+                    if *input >= task.inputs.len()
+                        || offset.checked_add(*length).is_none()
+                        || offset.saturating_add(*length) > *total_bytes
+                    {
+                        return Err(FabricError::InvalidTask(
+                            "invalid shard byte-range partition".into(),
+                        ));
+                    }
+                }
+                plurifold_core::TaskShardPartition::Records {
+                    input,
+                    record_start,
+                    record_count,
+                    total_records,
+                    offset,
+                    length,
+                    total_bytes,
+                } => {
+                    if *input >= task.inputs.len()
+                        || record_start.checked_add(*record_count).is_none()
+                        || record_start.saturating_add(*record_count) > *total_records
+                        || offset.checked_add(*length).is_none()
+                        || offset.saturating_add(*length) > *total_bytes
+                    {
+                        return Err(FabricError::InvalidTask(
+                            "invalid shard record partition".into(),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -1273,8 +1620,8 @@ mod tests {
     use plurifold_core::{
         Architecture, AutoShardPolicy, CooperativeJobSpec, CooperativeRoleSpec, CostHint,
         EffectSemantics, LinkProfile, LogicalJobSpec, LogicalRoleSpec, ObjectMetadata,
-        ResourceRequirements, RoleImplementation, ShardPartitionSpec, ShardPolicy, ShardPolicySpec,
-        TaskShardPartition, TaskSpec, TaskTemplate,
+        ResourceRequirements, RoleImplementation, RoleReductionSpec, ShardPartitionSpec,
+        ShardPolicy, ShardPolicySpec, TaskShardPartition, TaskSpec, TaskTemplate,
     };
 
     use super::*;
@@ -1398,6 +1745,7 @@ mod tests {
                     }],
                     depends_on: vec![],
                     shards: 1.into(),
+                    reduction: None,
                 },
                 LogicalRoleSpec {
                     name: "consumer".into(),
@@ -1421,6 +1769,7 @@ mod tests {
                     }],
                     depends_on: vec!["producer".into()],
                     shards: 1.into(),
+                    reduction: None,
                 },
             ],
             outputs: vec!["consumer".into()],
@@ -1453,6 +1802,7 @@ mod tests {
                     }],
                     depends_on: vec![],
                     shards: 1.into(),
+                    reduction: None,
                 },
                 LogicalRoleSpec {
                     name: "middle".into(),
@@ -1476,6 +1826,7 @@ mod tests {
                     }],
                     depends_on: vec!["producer".into()],
                     shards: 1.into(),
+                    reduction: None,
                 },
                 LogicalRoleSpec {
                     name: "consumer".into(),
@@ -1499,6 +1850,7 @@ mod tests {
                     }],
                     depends_on: vec!["middle".into()],
                     shards: 1.into(),
+                    reduction: None,
                 },
             ],
             outputs: vec!["consumer".into()],
@@ -1893,18 +2245,21 @@ mod tests {
             implementations: vec![logical_implementation("producer", "p", 1.0, 10)],
             depends_on: vec![],
             shards: 1.into(),
+            reduction: None,
         };
         let first_consumer = LogicalRoleSpec {
             name: "first".into(),
             implementations: vec![logical_implementation("first", "c", 1.0, 1)],
             depends_on: vec!["producer".into()],
             shards: 1.into(),
+            reduction: None,
         };
         let second_consumer = LogicalRoleSpec {
             name: "second".into(),
             implementations: vec![logical_implementation("second", "c", 1.0, 1)],
             depends_on: vec!["producer".into()],
             shards: 1.into(),
+            reduction: None,
         };
         let spec = LogicalJobSpec {
             id: JobId::new(),
@@ -2270,6 +2625,7 @@ mod tests {
                     )],
                     depends_on: vec![],
                     shards: 1.into(),
+                    reduction: None,
                 }],
                 outputs: vec!["compute".into()],
             })
@@ -2318,6 +2674,7 @@ mod tests {
                     )],
                     depends_on: vec![],
                     shards: 1.into(),
+                    reduction: None,
                 },
                 LogicalRoleSpec {
                     name: "join".into(),
@@ -2327,6 +2684,7 @@ mod tests {
                     ],
                     depends_on: vec!["root".into()],
                     shards: 1.into(),
+                    reduction: None,
                 },
             ],
             outputs: vec!["join".into()],
@@ -2415,6 +2773,7 @@ mod tests {
                         )],
                         depends_on: vec![],
                         shards: 3.into(),
+                        reduction: None,
                     },
                     LogicalRoleSpec {
                         name: "join".into(),
@@ -2426,6 +2785,7 @@ mod tests {
                         )],
                         depends_on: vec!["map".into()],
                         shards: 1.into(),
+                        reduction: None,
                     },
                 ],
                 outputs: vec!["join".into()],
@@ -2533,6 +2893,7 @@ mod tests {
                     )],
                     depends_on: vec![],
                     shards: 2.into(),
+                    reduction: None,
                 }],
                 outputs: vec!["map".into()],
             })
@@ -2575,6 +2936,7 @@ mod tests {
                     implementations: vec![implementation],
                     depends_on: vec![],
                     shards: 2.into(),
+                    reduction: None,
                 }],
                 outputs: vec!["map".into()],
             })
@@ -2612,6 +2974,190 @@ mod tests {
         assert_eq!(
             fabric.cooperative_role_views(job_id).unwrap()[0].status,
             CooperativeRoleStatus::Uncertain
+        );
+    }
+
+    #[test]
+    fn sharded_role_reduces_local_pair_before_cross_domain_final() {
+        let mut fabric = Fabric::default();
+        let a = ResourceId::new();
+        let b = ResourceId::new();
+        let c = ResourceId::new();
+        for worker in [a, b, c] {
+            let mut descriptor = resource(worker);
+            descriptor.features.insert("reduce:shard".into());
+            descriptor.features.insert("reduce:sum".into());
+            fabric.register_resource(descriptor);
+        }
+        fabric.upsert_link(LinkProfile {
+            from: a,
+            to: b,
+            rtt_ms: 0.1,
+            bandwidth_mbps: 10_000.0,
+        });
+        fabric.upsert_link(LinkProfile {
+            from: a,
+            to: c,
+            rtt_ms: 100.0,
+            bandwidth_mbps: 100.0,
+        });
+        fabric.upsert_link(LinkProfile {
+            from: b,
+            to: c,
+            rtt_ms: 100.0,
+            bandwidth_mbps: 100.0,
+        });
+        let job_id = JobId::new();
+        fabric
+            .submit_logical(LogicalJobSpec {
+                id: job_id,
+                roles: vec![LogicalRoleSpec {
+                    name: "map".into(),
+                    implementations: vec![logical_implementation(
+                        "worker",
+                        "reduce:shard",
+                        1_000.0,
+                        8,
+                    )],
+                    depends_on: vec![],
+                    shards: 3.into(),
+                    reduction: Some(RoleReductionSpec {
+                        name: "sum".into(),
+                        task: TaskTemplate {
+                            artifact: "builtin:sum-u64".into(),
+                            entrypoint: "run".into(),
+                            arguments: vec![],
+                            inputs: vec![],
+                            requirements: ResourceRequirements {
+                                required_features: BTreeSet::from(["reduce:sum".into()]),
+                                ..ResourceRequirements::default()
+                            },
+                            effects: EffectSemantics::Pure,
+                            cost: CostHint {
+                                compute_ms_on_reference: 10.0,
+                                output_bytes: 8,
+                            },
+                        },
+                        max_fan_in: 2,
+                        locality_rtt_ms: 1.0,
+                    }),
+                }],
+                outputs: vec!["map".into()],
+            })
+            .unwrap();
+
+        let role = fabric.cooperative_role_views(job_id).unwrap().remove(0);
+        let shard_tasks = match role.status {
+            CooperativeRoleStatus::Sharded { tasks, .. } => tasks,
+            status => panic!("map role was not sharded: {status:?}"),
+        };
+        assert_eq!(shard_tasks.len(), 3);
+        let mut shard_outputs = Vec::new();
+        for (index, task_id) in shard_tasks.iter().copied().enumerate() {
+            let lease = fabric.begin_execution(task_id, [a, b, c][index]).unwrap();
+            let output = ObjectId::new();
+            shard_outputs.push(output);
+            fabric
+                .complete_execution(
+                    &lease,
+                    vec![ObjectMetadata {
+                        id: output,
+                        size_bytes: 8,
+                        digest: Some(format!("sha256:reduce-shard-{index}")),
+                        encoding: None,
+                        locations: vec![lease.resource_id],
+                        producer: Some(task_id),
+                    }],
+                )
+                .unwrap();
+        }
+
+        let role = fabric.cooperative_role_views(job_id).unwrap().remove(0);
+        let level0_tasks = match role.status {
+            CooperativeRoleStatus::Reducing {
+                tasks,
+                completed: 0,
+                level: 0,
+            } => tasks,
+            status => panic!("map role did not enter first reduction level: {status:?}"),
+        };
+        assert_eq!(level0_tasks.len(), 1);
+        let level0_task = level0_tasks[0];
+        assert_eq!(
+            fabric.task_spec(level0_task).unwrap().inputs,
+            shard_outputs[..2]
+        );
+        let decision = fabric.schedule_task(level0_task).unwrap();
+        assert!(decision.resource_id == a || decision.resource_id == b);
+        let expired_lease = fabric
+            .begin_execution(level0_task, decision.resource_id)
+            .unwrap();
+        fabric.reap_expired_executions_at(expired_lease.expires_at_unix_ms);
+        assert_eq!(fabric.task_status(level0_task), Some(&TaskStatus::Pending));
+        assert!(matches!(
+            fabric.cooperative_role_views(job_id).unwrap()[0].status,
+            CooperativeRoleStatus::Reducing {
+                level: 0,
+                completed: 0,
+                ..
+            }
+        ));
+        let decision = fabric.schedule_task(level0_task).unwrap();
+        let lease = fabric
+            .begin_execution(level0_task, decision.resource_id)
+            .unwrap();
+        let local_sum = ObjectId::new();
+        fabric
+            .complete_execution(
+                &lease,
+                vec![ObjectMetadata {
+                    id: local_sum,
+                    size_bytes: 8,
+                    digest: Some("sha256:local-sum".into()),
+                    encoding: None,
+                    locations: vec![lease.resource_id],
+                    producer: Some(level0_task),
+                }],
+            )
+            .unwrap();
+
+        let role = fabric.cooperative_role_views(job_id).unwrap().remove(0);
+        let level1_tasks = match role.status {
+            CooperativeRoleStatus::Reducing {
+                tasks,
+                completed: 0,
+                level: 1,
+            } => tasks,
+            status => panic!("map role did not enter final reduction level: {status:?}"),
+        };
+        assert_eq!(level1_tasks.len(), 1);
+        let level1_task = level1_tasks[0];
+        assert_eq!(
+            fabric.task_spec(level1_task).unwrap().inputs,
+            vec![local_sum, shard_outputs[2]]
+        );
+        let decision = fabric.schedule_task(level1_task).unwrap();
+        let lease = fabric
+            .begin_execution(level1_task, decision.resource_id)
+            .unwrap();
+        let final_sum = ObjectId::new();
+        fabric
+            .complete_execution(
+                &lease,
+                vec![ObjectMetadata {
+                    id: final_sum,
+                    size_bytes: 8,
+                    digest: Some("sha256:final-sum".into()),
+                    encoding: None,
+                    locations: vec![lease.resource_id],
+                    producer: Some(level1_task),
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(
+            fabric.cooperative_job_status(job_id),
+            Some(CooperativeJobStatus::Completed(vec![final_sum]))
         );
     }
 
@@ -2673,6 +3219,7 @@ mod tests {
                         per_shard_overhead_ms: 0.0,
                         min_gain_ratio: 0.05,
                     })),
+                    reduction: None,
                 }],
                 outputs: vec!["map".into()],
             })

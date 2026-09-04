@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package plurifold.v1;
 
-// Transport-neutral design sketch. The v0.10 implementation uses HTTP/JSON DTOs
+// Transport-neutral design sketch. The v0.11 implementation uses HTTP/JSON DTOs
 // from the plurifold-protocol crate; this file is not generated into the Rust build.
 service Coordinator {
   rpc RegisterResource(RegisterResourceRequest) returns (MembershipLease);

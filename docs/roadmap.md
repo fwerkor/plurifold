@@ -49,7 +49,9 @@
 - [x] explicit sharded roles with multi-resource fan-out and deterministic all-shards fan-in
 - [x] topology-aware automatic shard-count selection for declared byte-range inputs
 - [x] range-aware peer transfer and range-sized scheduling cost
-- [ ] record/tensor-aware partitioners and hierarchical/quorum reduction policies
+- [x] application-supplied record-boundary partitioning with record-count-aware work scaling
+- [x] topology-aware ordered hierarchical reduction with local-first grouping and ordinary Task retries
+- [ ] automatic record-index discovery, tensor-aware partitioners, and commutative/quorum/streaming reduction policies
 
 ## Phase 3 — Topology and graph adaptation
 

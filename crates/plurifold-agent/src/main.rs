@@ -735,6 +735,42 @@ async fn execute_builtin_operation(
                 .cloned()
                 .ok_or_else(|| "builtin:shard-sleep-input requires one input".to_owned())
         }
+        "builtin:sum-records-u64" => {
+            shard.ok_or_else(|| "builtin:sum-records-u64 requires shard context".to_owned())?;
+            optional_builtin_sleep(arguments, "builtin:sum-records-u64").await?;
+            let bytes = inputs
+                .first()
+                .ok_or_else(|| "builtin:sum-records-u64 requires one input".to_owned())?;
+            let text = std::str::from_utf8(bytes)
+                .map_err(|_| "builtin:sum-records-u64 input must be UTF-8".to_owned())?;
+            let mut sum = 0u64;
+            for record in text.lines() {
+                let record = record.trim();
+                if record.is_empty() {
+                    continue;
+                }
+                let value = record
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid u64 record {record:?}"))?;
+                sum = sum
+                    .checked_add(value)
+                    .ok_or_else(|| "builtin:sum-records-u64 overflow".to_owned())?;
+            }
+            Ok(sum.to_le_bytes().to_vec())
+        }
+        "builtin:sum-u64" => {
+            optional_builtin_sleep(arguments, "builtin:sum-u64").await?;
+            let mut sum = 0u64;
+            for input in inputs {
+                let bytes: [u8; 8] = input.as_slice().try_into().map_err(|_| {
+                    "builtin:sum-u64 inputs must be 8-byte little-endian u64 values".to_owned()
+                })?;
+                sum = sum
+                    .checked_add(u64::from_le_bytes(bytes))
+                    .ok_or_else(|| "builtin:sum-u64 overflow".to_owned())?;
+            }
+            Ok(sum.to_le_bytes().to_vec())
+        }
         "builtin:sleep" => {
             let millis = arguments
                 .first()
@@ -748,6 +784,17 @@ async fn execute_builtin_operation(
         }
         other => Err(format!("unsupported artifact {other}")),
     }
+}
+
+async fn optional_builtin_sleep(arguments: &[String], artifact: &str) -> Result<(), String> {
+    let Some(value) = arguments.first() else {
+        return Ok(());
+    };
+    let millis = value
+        .parse::<u64>()
+        .map_err(|_| format!("{artifact} optional milliseconds must be an integer"))?;
+    tokio::time::sleep(Duration::from_millis(millis)).await;
+    Ok(())
 }
 
 fn data_router(state: DataState) -> Router {
@@ -1072,5 +1119,45 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(bytes, b"defg");
+    }
+
+    #[tokio::test]
+    async fn record_sum_and_u64_reduction_are_associative_over_complete_records() {
+        let shard_task = TaskSpec {
+            id: TaskId::new(),
+            artifact: "builtin:sum-records-u64".into(),
+            entrypoint: "run".into(),
+            arguments: vec![],
+            inputs: vec![],
+            requirements: ResourceRequirements::default(),
+            effects: EffectSemantics::Pure,
+            cost: CostHint::default(),
+            shard: Some(TaskShard {
+                index: 0,
+                count: 2,
+                partition: None,
+            }),
+            pipeline: None,
+        };
+        let left = execute_task(&shard_task, &[b"1\n20\n".to_vec()])
+            .await
+            .unwrap();
+        let right = execute_task(&shard_task, &[b"300\n4\n".to_vec()])
+            .await
+            .unwrap();
+        let reduction = TaskSpec {
+            id: TaskId::new(),
+            artifact: "builtin:sum-u64".into(),
+            entrypoint: "run".into(),
+            arguments: vec![],
+            inputs: vec![],
+            requirements: ResourceRequirements::default(),
+            effects: EffectSemantics::Pure,
+            cost: CostHint::default(),
+            shard: None,
+            pipeline: None,
+        };
+        let output = execute_task(&reduction, &[left, right]).await.unwrap();
+        assert_eq!(u64::from_le_bytes(output.try_into().unwrap()), 325);
     }
 }
