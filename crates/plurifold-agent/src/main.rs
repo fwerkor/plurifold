@@ -27,6 +27,9 @@ use reqwest::Client;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
+mod executor;
+use executor::{detect_accelerators, ExecutorPolicy};
+
 const PROBE_BYTES: usize = 256 * 1024;
 const MAX_PROBE_BYTES: usize = 1024 * 1024;
 const RTT_PROBE_SAMPLES: usize = 3;
@@ -60,6 +63,14 @@ enum Command {
         poll_interval_ms: u64,
         #[arg(long, default_value_t = 30_000)]
         probe_interval_ms: u64,
+        /// Permit native:/ and wasi:/ artifacts only from these canonical directory roots.
+        #[arg(long = "exec-root")]
+        exec_roots: Vec<PathBuf>,
+        /// Enable wasi: artifacts through the configured wasmtime executable.
+        #[arg(long, default_value_t = false)]
+        enable_wasi: bool,
+        #[arg(long, default_value = "wasmtime")]
+        wasmtime: PathBuf,
     },
 }
 
@@ -67,10 +78,12 @@ enum Command {
 struct ResourceArgs {
     #[arg(long, default_value = "local")]
     name: String,
-    #[arg(long, default_value_t = 8)]
-    cpu_cores: u32,
-    #[arg(long, default_value_t = 16)]
-    memory_gib: u64,
+    /// Override detected logical CPU count.
+    #[arg(long)]
+    cpu_cores: Option<u32>,
+    /// Override detected host memory in GiB.
+    #[arg(long)]
+    memory_gib: Option<u64>,
     #[arg(long, default_value_t = 1.0)]
     performance: f64,
     #[arg(long = "feature")]
@@ -101,10 +114,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match Args::parse().command {
         Command::Describe(resource) => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&descriptor(ResourceId::new(), &resource))?
-            );
+            let mut descriptor = descriptor(ResourceId::new(), &resource);
+            detect_accelerators(&mut descriptor);
+            println!("{}", serde_json::to_string_pretty(&descriptor)?);
         }
         Command::Run {
             resource,
@@ -115,7 +127,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             heartbeat_interval_ms,
             poll_interval_ms,
             probe_interval_ms,
+            exec_roots,
+            enable_wasi,
+            wasmtime,
         } => {
+            let executor = ExecutorPolicy::new(exec_roots, enable_wasi, wasmtime)?;
             let resource_id = ResourceId::new();
             let store = LocalObjectStore::new(store_dir)?;
             let advertise = advertise.unwrap_or_else(|| format!("http://{bind}"));
@@ -131,12 +147,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
 
+            let mut descriptor = descriptor(resource_id, &resource);
+            detect_accelerators(&mut descriptor);
+            if executor.native_enabled() {
+                descriptor.features.insert("executor:native".to_owned());
+            }
+            if executor.wasi_enabled() {
+                descriptor.features.insert("executor:wasi".to_owned());
+            }
+
             run_worker(
                 Client::new(),
                 coordinator.trim_end_matches('/').to_owned(),
                 advertise,
-                descriptor(resource_id, &resource),
+                descriptor,
                 store,
+                executor,
                 WorkerPeriods {
                     heartbeat: Duration::from_millis(heartbeat_interval_ms.max(50)),
                     poll: Duration::from_millis(poll_interval_ms.max(20)),
@@ -154,8 +180,11 @@ fn descriptor(id: ResourceId, args: &ResourceArgs) -> ResourceDescriptor {
         id,
         epoch: 0,
         architecture: current_architecture(),
-        cpu_cores: args.cpu_cores,
-        memory_bytes: args.memory_gib << 30,
+        cpu_cores: args.cpu_cores.unwrap_or_else(detected_cpu_cores),
+        memory_bytes: args
+            .memory_gib
+            .map(|gib| gib << 30)
+            .unwrap_or_else(detected_memory_bytes),
         accelerators: vec![],
         features: args
             .features
@@ -176,6 +205,7 @@ async fn run_worker(
     data_endpoint: String,
     descriptor: ResourceDescriptor,
     store: LocalObjectStore,
+    executor: ExecutorPolicy,
     periods: WorkerPeriods,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut lease = register(&client, &coordinator, &data_endpoint, &descriptor).await?;
@@ -211,12 +241,14 @@ async fn run_worker(
                         let client = client.clone();
                         let coordinator = coordinator.clone();
                         let store = store.clone();
+                        let executor = executor.clone();
                         let resource_id = descriptor.id;
                         tokio::spawn(async move {
                             if let Err(error) = execute_and_commit(
                                 &client,
                                 &coordinator,
                                 &store,
+                                &executor,
                                 resource_id,
                                 assignment,
                             ).await {
@@ -405,6 +437,7 @@ async fn execute_and_commit(
     client: &Client,
     coordinator: &str,
     store: &LocalObjectStore,
+    executor: &ExecutorPolicy,
     resource_id: ResourceId,
     assignment: WorkAssignment,
 ) -> Result<(), String> {
@@ -431,7 +464,8 @@ async fn execute_and_commit(
             );
         }
 
-        let output_bytes = execute_task(&assignment.task, &input_bytes).await?;
+        let output_bytes =
+            execute_task_with_policy(executor, &assignment.task, &input_bytes).await?;
         let stored = store
             .put(&output_bytes)
             .map_err(|error| error.to_string())?;
@@ -641,17 +675,34 @@ async fn materialize_input(
     Err(last_error)
 }
 
+#[cfg(test)]
 async fn execute_task(task: &TaskSpec, inputs: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+    execute_task_with_policy(&ExecutorPolicy::default(), task, inputs).await
+}
+
+async fn execute_task_with_policy(
+    executor: &ExecutorPolicy,
+    task: &TaskSpec,
+    inputs: &[Vec<u8>],
+) -> Result<Vec<u8>, String> {
     match &task.pipeline {
-        Some(pipeline) => execute_pipeline(pipeline, inputs, task.shard.as_ref()).await,
+        Some(pipeline) => execute_pipeline(executor, pipeline, inputs, task.shard.as_ref()).await,
         None => {
-            execute_builtin_operation(&task.artifact, &task.arguments, inputs, task.shard.as_ref())
-                .await
+            execute_operation(
+                executor,
+                &task.artifact,
+                &task.entrypoint,
+                &task.arguments,
+                inputs,
+                task.shard.as_ref(),
+            )
+            .await
         }
     }
 }
 
 async fn execute_pipeline(
+    executor: &ExecutorPolicy,
     pipeline: &TaskPipeline,
     inputs: &[Vec<u8>],
     shard: Option<&TaskShard>,
@@ -679,11 +730,35 @@ async fn execute_pipeline(
             }
         }
         previous = Some(
-            execute_builtin_operation(&stage.artifact, &stage.arguments, &stage_inputs, shard)
-                .await?,
+            execute_operation(
+                executor,
+                &stage.artifact,
+                &stage.entrypoint,
+                &stage.arguments,
+                &stage_inputs,
+                shard,
+            )
+            .await?,
         );
     }
     previous.ok_or_else(|| "task pipeline produced no output".to_owned())
+}
+
+async fn execute_operation(
+    executor: &ExecutorPolicy,
+    artifact: &str,
+    entrypoint: &str,
+    arguments: &[String],
+    inputs: &[Vec<u8>],
+    shard: Option<&TaskShard>,
+) -> Result<Vec<u8>, String> {
+    if artifact.starts_with("builtin:") {
+        execute_builtin_operation(artifact, arguments, inputs, shard).await
+    } else {
+        executor
+            .execute(artifact, entrypoint, arguments, inputs, shard)
+            .await
+    }
 }
 
 async fn execute_builtin_operation(
@@ -997,6 +1072,25 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+fn detected_cpu_cores() -> u32 {
+    std::thread::available_parallelism()
+        .map(|value| value.get().try_into().unwrap_or(u32::MAX))
+        .unwrap_or(1)
+}
+
+fn detected_memory_bytes() -> u64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|text| {
+            text.lines().find_map(|line| {
+                let rest = line.strip_prefix("MemTotal:")?;
+                let kib = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+                kib.checked_mul(1024)
+            })
+        })
+        .unwrap_or(16_u64 << 30)
+}
+
 fn current_architecture() -> Architecture {
     match std::env::consts::ARCH {
         "x86_64" => Architecture::X86_64,
@@ -1008,6 +1102,9 @@ fn current_architecture() -> Architecture {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
     use plurifold_core::{
         CostHint, EffectSemantics, ResourceRequirements, TaskId, TaskPipelineStage,
     };
@@ -1062,6 +1159,79 @@ mod tests {
             .unwrap();
         assert_eq!(output, b"leftright!");
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_executor_uses_staged_inputs_and_task_context() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("task.sh");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\ncat \"$PLURIFOLD_INPUT_0\"\nprintf '|%s|%s|%s' \"$PLURIFOLD_ENTRYPOINT\" \"$1\" \"$PLURIFOLD_SHARD_INDEX\"\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let policy = ExecutorPolicy::new(
+            vec![root.path().to_path_buf()],
+            false,
+            PathBuf::from("wasmtime"),
+        )
+        .unwrap();
+        let task = TaskSpec {
+            id: TaskId::new(),
+            artifact: format!("native:{}", executable.display()),
+            entrypoint: "transform".into(),
+            arguments: vec!["arg".into()],
+            inputs: vec![],
+            requirements: ResourceRequirements::default(),
+            effects: EffectSemantics::Pure,
+            cost: CostHint::default(),
+            shard: Some(TaskShard {
+                index: 2,
+                count: 4,
+                partition: None,
+            }),
+            pipeline: None,
+        };
+
+        let output = execute_task_with_policy(&policy, &task, &[b"payload".to_vec()])
+            .await
+            .unwrap();
+        assert_eq!(output, b"payload|transform|arg|2");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_executor_rejects_artifacts_outside_exec_roots() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let executable = outside.path().join("task.sh");
+        std::fs::write(&executable, "#!/bin/sh\nprintf nope\n").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let policy = ExecutorPolicy::new(
+            vec![allowed.path().to_path_buf()],
+            false,
+            PathBuf::from("wasmtime"),
+        )
+        .unwrap();
+        let error = policy
+            .execute(
+                &format!("native:{}", executable.display()),
+                "run",
+                &[],
+                &[],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("outside configured exec roots"));
+    }
+
     #[tokio::test]
     async fn shard_echo_observes_task_shard_context() {
         let task = TaskSpec {

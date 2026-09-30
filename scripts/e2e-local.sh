@@ -15,6 +15,13 @@ B_URL="http://127.0.0.1:${B_PORT}"
 C_URL="http://127.0.0.1:${C_PORT}"
 TMP=$(mktemp -d)
 PIDS=()
+mkdir -p "$TMP/exec"
+cat >"$TMP/exec/uppercase.sh" <<'SH'
+#!/usr/bin/env sh
+set -eu
+tr '[:lower:]' '[:upper:]' <"$PLURIFOLD_INPUT_0"
+SH
+chmod +x "$TMP/exec/uppercase.sh"
 
 cleanup() {
   for pid in "${PIDS[@]:-}"; do
@@ -221,6 +228,7 @@ wait_http "$COORD/healthz"
   --bind "127.0.0.1:${A_PORT}" \
   --advertise "$A_URL" \
   --store-dir "$TMP/a" \
+  --exec-root "$TMP/exec" \
   --heartbeat-interval-ms 150 \
   --poll-interval-ms 50 \
   --probe-interval-ms 100 \
@@ -280,6 +288,17 @@ BLOB_COUNT=$(find "$TMP/b/sha256" -type f | wc -l)
 [[ "$BLOB_COUNT" -ge 3 ]]
 
 echo "peer-transfer: ok (worker-b cached $BLOB_COUNT blobs)"
+
+NATIVE_TASK=$(./target/debug/plurifold submit \
+  --coordinator "$COORD" \
+  --artifact "native:$TMP/exec/uppercase.sh" \
+  --input "$OBJ_A" \
+  --require-feature executor:native \
+  --compute-ms 100)
+./target/debug/plurifold wait --coordinator "$COORD" --task "$NATIVE_TASK" --timeout-s 10 >/dev/null
+NATIVE_EXPECTED=$(printf 'HELLO-' | sha256sum | awk '{print $1}')
+[[ -f "$TMP/a/sha256/$NATIVE_EXPECTED" ]]
+echo "native-executor: ok (external executable consumed staged input and published CAS output)"
 
 cat >"$TMP/cooperative-job.json" <<'JSON'
 {
