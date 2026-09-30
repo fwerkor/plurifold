@@ -22,7 +22,7 @@
 - [x] replay-safe retry after worker loss
 - [x] multi-process failure-injection E2E
 - [ ] stable agent identity across process restarts
-- [ ] native/WASI sandboxed executor
+- [x] allow-listed native executor plus staged-input WASI/Wasmtime executor
 - [ ] durable coordinator state and restart recovery
 - [ ] authentication/TLS and trust-domain policy enforcement
 - [ ] benchmark-driven resource performance models
@@ -66,10 +66,10 @@
 
 ## Phase 4 — Heterogeneous accelerators
 
-- [ ] CUDA executor adapter
+- [x] CUDA-capable native task path with automatic NVIDIA discovery
 - [ ] ROCm executor adapter
-- [ ] Ascend/CANN executor adapter
-- [ ] real accelerator-backed implementation selection through CUDA/ROCm/CANN executors
+- [x] Ascend/CANN-capable native task path with automatic Ascend discovery
+- [x] scheduler-visible CUDA/CANN implementation constraints and real-device smoke path
 - [ ] site-local collective groups
 
 ## Phase 5 — Stateful primitives

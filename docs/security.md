@@ -1,6 +1,6 @@
 # Security and trust model
 
-Plurifold's target environment can cross administrative and network boundaries, so security cannot be treated as an RPC implementation detail. The v0 code does not yet enforce these mechanisms, but the architecture reserves the following boundaries.
+Plurifold's target environment can cross administrative and network boundaries, so security cannot be treated as an RPC implementation detail. The v0.12 prototype still lacks authenticated membership/TLS, but it now enforces a minimal artifact-execution boundary while reserving the stronger production mechanisms below.
 
 ## Identities and authenticated membership
 
@@ -12,7 +12,7 @@ Task artifacts and immutable objects should be content-addressed or carry crypto
 
 ## Capability-scoped execution
 
-Portable tasks should receive explicit capabilities rather than ambient host authority. WASI's capability-oriented model is attractive for sandboxable CPU tasks. Native/OCI and accelerator executors require equivalent policy around filesystem, network, devices, and secrets.
+Portable tasks should receive explicit capabilities rather than ambient host authority. v0.12's WASI path pre-opens only the staged task directory. Native artifacts are canonicalized and must remain below explicit `--exec-root` allow-lists, but native execution is **not** a sandbox and retains the host authority of the agent process. Production native/OCI and accelerator executors still require stronger filesystem, network, device, and secret isolation.
 
 ## Secrets
 

@@ -50,7 +50,7 @@ Resource fabric
 
 ## Repository status
 
-The repository now contains a **v0.11 networked research prototype**, not only a design scaffold:
+The repository now contains a **v0.12 networked research prototype**, not only a design scaffold:
 
 - typed Resource, Task, Object, Topology, membership-lease, and execution-lease models;
 - a topology-aware placement cost model;
@@ -72,11 +72,15 @@ The repository now contains a **v0.11 networked research prototype**, not only a
 - a SHA-256 content-addressed local object cache;
 - direct agent-to-agent HTTP object transfer with digest verification and replica registration;
 - replay-safe retry after worker loss, with non-replay-safe tasks entering `Uncertain`;
-- a small builtin executor (`identity`, `concat`, `echo`, `sleep`, plus shard-observation test operations) used to exercise the runtime without hiding unimplemented portability behind a fake generic executor;
+- a small builtin executor (`identity`, `concat`, `echo`, `sleep`, plus shard-observation test operations) for deterministic runtime tests;
+- an allow-listed native artifact ABI: `native:/absolute/path` tasks are accepted only below configured `--exec-root` directories, receive materialized Object inputs and shard metadata through a versioned environment ABI, and publish stdout back into the CAS;
+- an optional WASI artifact path through Wasmtime: `wasi:/absolute/path` runs with only the staged work directory pre-opened and uses the same task/shard ABI;
+- automatic host CPU/memory discovery plus NVIDIA GPU and Ascend NPU discovery, including scheduler-visible accelerator counts, per-device memory, and `cuda`/`cann` features;
 - a CLI for object publication, task/cooperative-job submission, planner preview/auto-submit, resource inspection, and manual topology overrides;
-- a multi-process E2E test that verifies direct peer transfer, explicit cooperative execution, hot-join-driven replanning, fixed fan-out, automatic byte-range fan-out, record-aligned A/B/C sharding with local-first two-level reduction and exact numeric result, graph fusion/coarsening, cross-resource joins, and takeover after worker loss.
+- a multi-process E2E test that verifies direct peer transfer, real native executable execution, explicit cooperative execution, hot-join-driven replanning, fixed fan-out, automatic byte-range fan-out, record-aligned A/B/C sharding with local-first two-level reduction and exact numeric result, graph fusion/coarsening, cross-resource joins, and takeover after worker loss;
+- repeatable hardware smoke tests for CUDA-driver and Ascend/CANN execution through the same coordinator → scheduler → lease → executor → CAS path.
 
-Still intentionally missing: authentication/TLS, durable coordinator state, native/WASI sandboxed executors, accelerator adapters, automatic record-index discovery, tensor-aware partitioners, commutative/quorum/streaming reductions, arbitrary general-DAG fusion/batching, speculative replication/migration, and production-grade observability.
+Still intentionally missing: authentication/TLS, durable coordinator state, stable agent identities, a ROCm-backed hardware path, stronger isolation for native executables, automatic record-index discovery, tensor-aware partitioners, commutative/quorum/streaming reductions, arbitrary general-DAG fusion/batching, speculative replication/migration, stateful Actor/Stream/Collective primitives, and production-grade observability.
 
 ## Quick start
 
@@ -105,6 +109,30 @@ cargo run -p plurifold-agent -- run \
 ```
 
 The defaults bind to loopback. The current control plane is unauthenticated, so do not expose it to an untrusted network.
+
+### Real executable tasks
+
+Native execution is disabled by default. Enable only directories whose executables you trust:
+
+```bash
+cargo run -p plurifold-agent -- run \
+  --name worker-a \
+  --coordinator http://127.0.0.1:8080 \
+  --bind 127.0.0.1:8081 \
+  --advertise http://127.0.0.1:8081 \
+  --exec-root /opt/plurifold/tasks
+```
+
+A task artifact such as `native:/opt/plurifold/tasks/transform` receives `PLURIFOLD_ABI=1`, `PLURIFOLD_ENTRYPOINT`, `PLURIFOLD_INPUT_COUNT`, `PLURIFOLD_INPUT_N`, and shard/range variables when applicable. Inputs are immutable staged files; stdout is the task's output Object. Paths are canonicalized and rejected when they escape every configured root.
+
+Add `--enable-wasi --wasmtime /path/to/wasmtime` to enable `wasi:/...` artifacts. WASI tasks receive the same ABI, with the staged directory pre-opened as `/work`.
+
+On supported hosts the agent automatically advertises NVIDIA GPUs and Ascend NPUs. Logical implementations can require normal accelerator constraints and/or the detected `cuda` or `cann` features. To exercise the actual device path on a machine, run:
+
+```bash
+./scripts/e2e-hardware-local.sh cuda
+./scripts/e2e-hardware-local.sh cann
+```
 
 Agents automatically discover other advertised data endpoints. Every unordered peer pair has one probing agent; it periodically takes three lightweight RTT samples and one bounded throughput sample. The default probe interval is 30 seconds and can be changed with `--probe-interval-ms`. Automatic discovery requires the advertised agent endpoints to be mutually routable; if a probe becomes unreachable, that automatic link is removed. `plurifold link` remains available as an explicit operator override and is not overwritten by automatic measurements.
 
@@ -142,7 +170,7 @@ cargo run -p plurifold-cli -- job auto-submit \
 
 A logical role may still set `shards: N` (default `1`). That fixed form preserves the previous numeric-shard contract: N independent contributions receive the same logical inputs, `TaskShard { index, count }` identifies each contribution, and cost hints are per child.
 
-For partitionable work, v0.11 accepts an automatic policy. Raw bytes use the existing form:
+For partitionable work, v0.12 accepts an automatic policy. Raw bytes use the existing form:
 
 ```json
 "shards": {
@@ -196,7 +224,7 @@ After all shard outputs exist, Plurifold keeps their shard-index order, forms co
 
 This still is not arbitrary semantic understanding: tensor axes, automatic record-index construction, commutative reordering, quorum reduction, and source-program decomposition remain outside the v0.11 claim.
 
-For unsharded roles, v0.11 retains adaptive linear-chain fusion. Fixed multi-shard and auto-sharded roles are explicit graph boundaries and are not absorbed into a fused `TaskPipeline`. Predicted resources remain advisory rather than hard bindings, and lease-time scheduling is authoritative.
+For unsharded roles, v0.12 retains adaptive linear-chain fusion. Fixed multi-shard and auto-sharded roles are explicit graph boundaries and are not absorbed into a fused `TaskPipeline`. Predicted resources remain advisory rather than hard bindings, and lease-time scheduling is authoritative.
 
 ## Design invariants
 

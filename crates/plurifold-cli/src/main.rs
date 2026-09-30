@@ -37,7 +37,7 @@ enum Command {
         #[arg(long)]
         file: PathBuf,
     },
-    /// Submit a task. Phase 1 agents currently implement builtin:* artifacts.
+    /// Submit a task to builtin, allow-listed native, or optional WASI executors.
     Submit {
         #[arg(long)]
         coordinator: String,

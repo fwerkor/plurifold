@@ -36,7 +36,7 @@ When `reduction` is present, “all children complete” transitions the role in
 
 This creates two separate decisions: **shard-count/implementation selection at role readiness** and **resource placement at execution lease time**. The former may change from the earlier preview after hot joins or topology/locality changes; the latter may still move a child Task to another compatible Resource. If a replay-safe shard loses its lease it returns to `Pending` without invalidating completed sibling shards. If an unreplayable shard becomes `Uncertain`, the whole logical role and job become `Uncertain`.
 
-`auto-submit` may make a third decision before role materialization: **graph coarsening**. v0.11 follows a maximal safe linear chain beginning at the ready role, stopping at fan-out, fan-in, a declared intermediate job output, or another graph-shape boundary. It evaluates every consecutive Pure builtin-family prefix of length at least two whose selected requirements can coexist on one Resource. The chosen prefix is not simply the longest one: the runtime compares the projected end-to-end cost of the whole chain, including the best separately placed suffix, against fully separate execution.
+`auto-submit` may make a third decision before role materialization: **graph coarsening**. v0.12 follows a maximal safe linear chain beginning at the ready role, stopping at fan-out, fan-in, a declared intermediate job output, or another graph-shape boundary. It evaluates every consecutive Pure builtin-family prefix of length at least two whose selected requirements can coexist on one Resource. The chosen prefix is not simply the longest one: the runtime compares the projected end-to-end cost of the whole chain, including the best separately placed suffix, against fully separate execution.
 
 A selected prefix becomes one multi-stage `TaskPipeline`. All fused logical roles refer to the same Task ID while it runs. Intermediate fused stages complete with no published Object; the last fused stage publishes the pipeline output. If later roles remain outside the prefix, that output is the normal Object input for the suffix. Thus a three-role chain may become one three-stage task, or a two-stage task followed by one ordinary Task, depending on topology and compute costs.
 
@@ -95,4 +95,14 @@ Collectives are explicit, topology-constrained operations. They are never automa
 
 ## Portable execution ABI
 
-Plurifold separates the **control/data model** from the **artifact execution ABI**. WASI 0.3 / the WebAssembly Component Model is a strong candidate for portable CPU-side tasks because it offers typed cross-language composition and native async primitives. Accelerator-heavy tasks will often remain backend-specific; the scheduler can select among multiple implementations of one logical task.
+Plurifold separates the **control/data model** from the **artifact execution ABI**.
+
+v0.12 has three execution paths:
+
+- `builtin:*` operations for deterministic runtime tests;
+- `native:/absolute/path` artifacts, enabled only under operator-supplied `--exec-root` directories;
+- `wasi:/absolute/path` artifacts, optionally executed by Wasmtime with only the staged task directory pre-opened.
+
+The external ABI is intentionally small. `PLURIFOLD_ABI=1` identifies the contract; `PLURIFOLD_INPUT_N` points at immutable staged Object files; entrypoint and shard/range context are carried in environment variables; successful stdout becomes the immutable output Object. The native path is allow-listed but not a security sandbox, while the WASI path supplies the portable capability-oriented boundary.
+
+Accelerator-heavy tasks remain backend-native. The agent discovers NVIDIA and Ascend devices and advertises scheduler-visible accelerator descriptors plus `cuda`/`cann` features, so a logical role can provide separate backend implementations without pretending vendor kernels are portable.
